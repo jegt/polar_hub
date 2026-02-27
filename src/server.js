@@ -7,22 +7,23 @@
  * Run with: npm start
  */
 
-import 'dotenv/config';
 import express from 'express';
 import { createServer } from 'http';
+import { createWriteStream, mkdirSync } from 'fs';
 import { readFile } from 'fs/promises';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { calculateHRV, createRRValidator, createRRBuffer } from './hrv.js';
 import { createInfluxClient, createHRVWriters } from './influx.js';
+import config from './config.js';
 
 // Get directory path for serving static files
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 // Configuration
-const PORT = parseInt(process.env.PORT || '3000');
-const HRV_SUMMARY_INTERVAL_MS = parseInt(process.env.HRV_SUMMARY_INTERVAL_MS || '300000');
+const PORT = config.port;
+const HRV_SUMMARY_INTERVAL_MS = config.hrvSummaryIntervalMs;
 const LOG_REQUESTS = process.argv.includes('--log-requests');
 const GAP_THRESHOLD_MS = 300;
 
@@ -34,7 +35,11 @@ const RR_MAX_DIFF_PCT = 0.20;
 const SESSION_WARMUP_BEATS = 10;
 
 // Create components
-const influx = createInfluxClient();
+const influx = createInfluxClient({
+  host: config.influxHost,
+  port: config.influxPort,
+  database: config.influxDatabase
+});
 const writers = createHRVWriters(influx, log);
 
 // Events that get persisted to InfluxDB (category.event); everything else is log-only
@@ -76,14 +81,20 @@ function getDeviceState(device) {
 }
 
 /**
- * Log with timestamp
+ * Log with timestamp (stdout + logs/hub.log)
  */
+const logDir = join(__dirname, '..', 'logs');
+mkdirSync(logDir, { recursive: true });
+const logStream = createWriteStream(join(logDir, 'hub.log'), { flags: 'a' });
+
 function localTimestamp(date = new Date()) {
   return date.toLocaleString('sv-SE', { hour12: false }).replace(' ', 'T');
 }
 
 function log(message) {
-  console.log(`[${localTimestamp()}] ${message}`);
+  const line = `[${localTimestamp()}] ${message}`;
+  console.log(line);
+  logStream.write(line + '\n');
 }
 
 /**

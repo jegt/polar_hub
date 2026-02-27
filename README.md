@@ -13,23 +13,25 @@ Includes a built-in status page with real-time updates via Server-Sent Events.
 
 ```bash
 npm install
-cp .env.example .env   # edit with your InfluxDB host/database
+cp config.example.json config.json   # edit with your InfluxDB host/database
 npm run server
 ```
 
 The server starts on port 3000 by default. Use `npm run server:debug` to enable request logging.
 
+Logs are written to both stdout and `logs/hub.log`.
+
 ## Configuration
 
-All configuration is done via environment variables (or a `.env` file):
+All configuration is done via `config.json` in the project root. Copy `config.example.json` to get started. Any missing keys fall back to defaults.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `INFLUX_HOST` | `localhost` | InfluxDB host |
-| `INFLUX_PORT` | `8086` | InfluxDB port |
-| `INFLUX_DATABASE` | `polar_hub` | InfluxDB database name |
-| `PORT` | `3000` | HTTP server port |
-| `HRV_SUMMARY_INTERVAL_MS` | `300000` | HRV summary write interval (ms) |
+| Key | Default | Description |
+|-----|---------|-------------|
+| `influxHost` | `"localhost"` | InfluxDB host |
+| `influxPort` | `8086` | InfluxDB port |
+| `influxDatabase` | `"polar_hub"` | InfluxDB database name |
+| `port` | `3000` | HTTP server port |
+| `hrvSummaryIntervalMs` | `300000` | HRV summary write interval (ms) |
 
 ## API Endpoints
 

@@ -8,7 +8,6 @@
         "server:debug": "node src/server.js --log-requests"
     },
     "dependencies": {
-        "dotenv": "^17.3.1",
         "express": "^4.18.2",
         "influx": "^5.12.0"
     }

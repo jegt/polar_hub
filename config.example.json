@@ -1,0 +1,7 @@
+{
+  "influxHost": "localhost",
+  "influxPort": 8086,
+  "influxDatabase": "polar_hub",
+  "port": 3000,
+  "hrvSummaryIntervalMs": 300000
+}

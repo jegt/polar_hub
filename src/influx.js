@@ -4,22 +4,12 @@
 
 import Influx from 'influx';
 
-// Default configuration
-const DEFAULT_HOST = 'localhost';
-const DEFAULT_PORT = 8086;
-const DEFAULT_DATABASE = 'polar_hub';
-
 /**
  * Create an InfluxDB client
- * @param {Object} options - Connection options
+ * @param {Object} options - Connection options (host, port, database)
  * @returns {Object} InfluxDB client instance
  */
-export function createInfluxClient(options = {}) {
-  const {
-    host = process.env.INFLUX_HOST || DEFAULT_HOST,
-    port = parseInt(process.env.INFLUX_PORT || DEFAULT_PORT),
-    database = process.env.INFLUX_DATABASE || DEFAULT_DATABASE
-  } = options;
+export function createInfluxClient({ host, port, database }) {
 
   return new Influx.InfluxDB({ 
     host, 

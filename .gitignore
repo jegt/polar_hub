@@ -2,6 +2,7 @@
 node_modules/
 
 # Logs
+logs/
 *.log
 npm-debug.log*
 
@@ -9,10 +10,10 @@ npm-debug.log*
 *.json
 !package.json
 !package-lock.json
+!config.example.json
 
-# Environment
-.env
-.env.local
+# Config
+config.json
 
 # OS files
 .DS_Store
