@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Polar Hub Status</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    :root {
+      --bg: #0f0f0f;
+      --card-bg: #1a1a1a;
+      --border: #333;
+      --text: #e0e0e0;
+      --text-dim: #888;
+      --accent: #4ecdc4;
+      --heart: #ff6b6b;
+      --success: #4ecdc4;
+      --warning: #ffd93d;
+      --error: #ff6b6b;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 16px;
+      padding-bottom: env(safe-area-inset-bottom, 16px);
+    }
+
+    .container {
+      max-width: 800px;
+      margin: 0 auto;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 20px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    h1 {
+      font-size: 1.5rem;
+      font-weight: 600;
+    }
+
+    .connection-status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.875rem;
+    }
+
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--error);
+    }
+
+    .status-dot.connected {
+      background: var(--success);
+      animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+
+      0%,
+      100% {
+        opacity: 1;
+      }
+
+      50% {
+        opacity: 0.5;
+      }
+    }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+
+    .card-title {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-dim);
+      margin-bottom: 12px;
+    }
+
+    /* Heart Rate Display */
+    .heart-rate-display {
+      text-align: center;
+      padding: 24px 0;
+    }
+
+    .heart-icon {
+      font-size: 2rem;
+      margin-bottom: 8px;
+      animation: heartbeat 1s ease-in-out infinite;
+    }
+
+    @keyframes heartbeat {
+
+      0%,
+      100% {
+        transform: scale(1);
+      }
+
+      15% {
+        transform: scale(1.15);
+      }
+
+      30% {
+        transform: scale(1);
+      }
+
+      45% {
+        transform: scale(1.1);
+      }
+    }
+
+    .heart-rate-value {
+      font-size: 4rem;
+      font-weight: 700;
+      color: var(--heart);
+      line-height: 1;
+    }
+
+    .heart-rate-unit {
+      font-size: 1.25rem;
+      color: var(--text-dim);
+      margin-left: 4px;
+    }
+
+    .rr-value {
+      font-size: 1.25rem;
+      color: var(--text-dim);
+      margin-top: 8px;
+    }
+
+    /* Stats Grid */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+    }
+
+    .stat {
+      text-align: center;
+      padding: 12px 8px;
+      background: rgba(255, 255, 255, 0.03);
+      border-radius: 8px;
+    }
+
+    .stat-value {
+      font-size: 1.5rem;
+      font-weight: 600;
+      color: var(--accent);
+    }
+
+    .stat-label {
+      font-size: 0.75rem;
+      color: var(--text-dim);
+      margin-top: 4px;
+    }
+
+    /* Relay Info */
+    .relay-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px 0;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .relay-item:last-child {
+      border-bottom: none;
+      padding-bottom: 0;
+    }
+
+    .relay-name {
+      font-weight: 500;
+    }
+
+    .relay-status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.875rem;
+    }
+
+    .relay-status.active {
+      color: var(--success);
+    }
+
+    .relay-status.disconnected {
+      color: var(--error);
+    }
+
+    /* Info Grid */
+    .info-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 8px;
+    }
+
+    .info-item {
+      display: flex;
+      justify-content: space-between;
+      padding: 8px 0;
+    }
+
+    .info-label {
+      color: var(--text-dim);
+    }
+
+    .info-value {
+      font-weight: 500;
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* RR Buffer Visualization */
+    .rr-buffer {
+      display: flex;
+      align-items: flex-end;
+      height: 60px;
+      gap: 2px;
+      padding-top: 8px;
+    }
+
+    .rr-bar {
+      flex: 1;
+      background: var(--accent);
+      border-radius: 2px 2px 0 0;
+      min-width: 4px;
+      max-width: 20px;
+      opacity: 0.7;
+      transition: height 0.2s ease;
+    }
+
+    .rr-bar:last-child {
+      opacity: 1;
+    }
+
+    /* No Data State */
+    .no-data {
+      text-align: center;
+      padding: 48px 16px;
+      color: var(--text-dim);
+    }
+
+    .no-data-icon {
+      font-size: 3rem;
+      margin-bottom: 16px;
+      opacity: 0.5;
+    }
+
+    /* Posture Badge */
+    .posture-badge {
+      display: inline-block;
+      padding: 4px 12px;
+      border-radius: 16px;
+      font-size: 0.875rem;
+      font-weight: 500;
+      background: rgba(78, 205, 196, 0.2);
+      color: var(--accent);
+      margin-top: 12px;
+    }
+
+    /* Responsive */
+    @media (max-width: 480px) {
+      body {
+        padding: 12px;
+      }
+
+      .heart-rate-value {
+        font-size: 3rem;
+      }
+
+      .stats-grid {
+        grid-template-columns: repeat(3, 1fr);
+        gap: 8px;
+      }
+
+      .stat {
+        padding: 8px 4px;
+      }
+
+      .stat-value {
+        font-size: 1.25rem;
+      }
+
+      .info-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    /* Debug Panel */
+    .debug-panel {
+      margin-top: 24px;
+      padding-top: 16px;
+      border-top: 1px solid var(--border);
+    }
+
+    .debug-toggle {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      padding: 8px 16px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 0.875rem;
+      width: 100%;
+    }
+
+    .debug-toggle:hover {
+      background: rgba(255, 255, 255, 0.05);
+    }
+
+    .debug-content {
+      display: none;
+      margin-top: 12px;
+    }
+
+    .debug-content.visible {
+      display: block;
+    }
+
+    .debug-json {
+      background: #0a0a0a;
+      border-radius: 8px;
+      padding: 12px;
+      font-family: 'SF Mono', Monaco, monospace;
+      font-size: 0.75rem;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+      max-height: 300px;
+      overflow-y: auto;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="container">
+    <header>
+      <h1>Polar Hub</h1>
+      <div class="connection-status">
+        <span class="status-dot" id="statusDot"></span>
+        <span id="connectionText">Connecting...</span>
+      </div>
+    </header>
+
+    <div id="noData" class="card no-data">
+      <div class="no-data-icon">💓</div>
+      <div>Waiting for heartbeat data...</div>
+    </div>
+
+    <div id="mainContent" style="display: none;">
+      <!-- Heart Rate Card -->
+      <div class="card">
+        <div class="heart-rate-display">
+          <div class="heart-icon">❤️</div>
+          <div>
+            <span class="heart-rate-value" id="heartRate">--</span>
+            <span class="heart-rate-unit">bpm</span>
+          </div>
+          <div class="rr-value">RMSSD: <span id="rmssdMain">--</span></div>
+          <div class="posture-badge" id="postureBadge">unknown</div>
+        </div>
+      </div>
+
+      <!-- HRV Stats -->
+      <div class="card">
+        <div class="card-title">HRV Metrics</div>
+        <div class="stats-grid">
+          <div class="stat">
+            <div class="stat-value" id="rmssd">--</div>
+            <div class="stat-label">RMSSD</div>
+          </div>
+          <div class="stat">
+            <div class="stat-value" id="sdnn">--</div>
+            <div class="stat-label">SDNN</div>
+          </div>
+          <div class="stat">
+            <div class="stat-value" id="pnn50">--</div>
+            <div class="stat-label">pNN50</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- RMSSD Buffer Visualization -->
+      <div class="card">
+        <div class="card-title">RMSSD History (last 30)</div>
+        <div class="rr-buffer" id="rmssdBufferChart"></div>
+      </div>
+
+      <!-- Relay Status -->
+      <div class="card">
+        <div class="card-title">Relays</div>
+        <div id="relayList">
+          <div class="relay-item">
+            <span class="relay-name">No relays connected</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Hub Info -->
+      <div class="card">
+        <div class="card-title">Hub Status</div>
+        <div class="info-grid">
+          <div class="info-item">
+            <span class="info-label">Uptime</span>
+            <span class="info-value" id="uptime">--</span>
+          </div>
+          <div class="info-item">
+            <span class="info-label">Total Beats</span>
+            <span class="info-value" id="totalBeats">--</span>
+          </div>
+          <div class="info-item">
+            <span class="info-label">Deduplicated</span>
+            <span class="info-value" id="dedupCount">--</span>
+          </div>
+          <div class="info-item">
+            <span class="info-label">Last Update</span>
+            <span class="info-value" id="lastUpdate">--</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Debug Panel -->
+    <div class="debug-panel">
+      <button class="debug-toggle" id="debugToggle">Show Raw Data</button>
+      <div class="debug-content" id="debugContent">
+        <pre class="debug-json" id="debugJson">{}</pre>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // SSE connection
+    let eventSource = null;
+    let lastData = null;
+
+    const statusDot = document.getElementById('statusDot');
+    const connectionText = document.getElementById('connectionText');
+    const noData = document.getElementById('noData');
+    const mainContent = document.getElementById('mainContent');
+    const debugToggle = document.getElementById('debugToggle');
+    const debugContent = document.getElementById('debugContent');
+    const debugJson = document.getElementById('debugJson');
+
+    // Debug panel toggle
+    debugToggle.addEventListener('click', () => {
+      debugContent.classList.toggle('visible');
+      debugToggle.textContent = debugContent.classList.contains('visible')
+        ? 'Hide Raw Data'
+        : 'Show Raw Data';
+    });
+
+    function connect() {
+      connectionText.textContent = 'Connecting...';
+
+      eventSource = new EventSource('/events');
+
+      eventSource.onopen = () => {
+        statusDot.classList.add('connected');
+        connectionText.textContent = 'Connected';
+      };
+
+      eventSource.onerror = (err) => {
+        console.error('SSE error:', err);
+        statusDot.classList.remove('connected');
+        connectionText.textContent = 'Reconnecting...';
+        // EventSource automatically reconnects
+      };
+
+      eventSource.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          lastData = data;
+          updateUI(data);
+          debugJson.textContent = JSON.stringify(data, null, 2);
+        } catch (err) {
+          console.error('Failed to parse message:', err);
+        }
+      };
+    }
+
+    function updateUI(data) {
+      const deviceIds = Object.keys(data.devices || {});
+
+      if (deviceIds.length === 0) {
+        noData.style.display = 'block';
+        mainContent.style.display = 'none';
+        return;
+      }
+
+      noData.style.display = 'none';
+      mainContent.style.display = 'block';
+
+      // Use first device (typically only one)
+      const device = data.devices[deviceIds[0]];
+
+      // Heart rate and RR
+      document.getElementById('heartRate').textContent = device.heartRate || '--';
+      const hrv = device.hrv || {};
+      document.getElementById('rmssdMain').textContent = hrv.rmssd !== null ? hrv.rmssd : '--';
+      document.getElementById('postureBadge').textContent = device.posture || 'unknown';
+
+      // HRV metrics
+      document.getElementById('rmssd').textContent = hrv.rmssd !== null ? hrv.rmssd : '--';
+      document.getElementById('sdnn').textContent = hrv.sdnn !== null ? hrv.sdnn : '--';
+      document.getElementById('pnn50').textContent = hrv.pnn50 !== null ? hrv.pnn50 + '%' : '--';
+
+      // RMSSD Buffer visualization
+      const rmssdBuffer = device.rmssdBuffer || [];
+      const rmssdBufferEl = document.getElementById('rmssdBufferChart');
+      if (rmssdBuffer.length > 0) {
+        const minRmssd = Math.min(...rmssdBuffer);
+        const maxRmssd = Math.max(...rmssdBuffer);
+        const range = maxRmssd - minRmssd || 1;
+
+        rmssdBufferEl.innerHTML = rmssdBuffer.map(val => {
+          const height = 20 + ((val - minRmssd) / range) * 40;
+          return `<div class="rr-bar" style="height: ${height}px" title="${val.toFixed(1)}"></div>`;
+        }).join('');
+      }
+
+      // Total beats
+      document.getElementById('totalBeats').textContent = device.totalBeats || 0;
+
+      // Relay list
+      const relays = data.relays || {};
+      const relayIds = Object.keys(relays);
+      const relayList = document.getElementById('relayList');
+
+      if (relayIds.length > 0) {
+        relayList.innerHTML = relayIds.map(id => {
+          const relay = relays[id];
+          const isActive = relay.status === 'active' || relay.status === 'connected';
+          const statusClass = isActive ? 'active' : 'disconnected';
+          const rssiText = relay.rssi !== null ? `${relay.rssi} dBm` : '';
+          const ago = relay.lastSeen ? formatTimeAgo(relay.lastSeen) : '';
+
+          return `
+            <div class="relay-item">
+              <span class="relay-name">${id}</span>
+              <span class="relay-status ${statusClass}">
+                ${rssiText} ${ago}
+              </span>
+            </div>
+          `;
+        }).join('');
+      } else {
+        relayList.innerHTML = '<div class="relay-item"><span class="relay-name">No relays connected</span></div>';
+      }
+
+      // Hub info
+      if (data.hub) {
+        document.getElementById('uptime').textContent = formatDuration(data.hub.uptime);
+        if (data.hub.dedup) {
+          document.getElementById('dedupCount').textContent = data.hub.dedup.duplicatesFiltered || 0;
+        }
+      }
+
+      // Last update
+      document.getElementById('lastUpdate').textContent = new Date(data.timestamp).toLocaleTimeString();
+    }
+
+    function formatDuration(ms) {
+      const seconds = Math.floor(ms / 1000);
+      const minutes = Math.floor(seconds / 60);
+      const hours = Math.floor(minutes / 60);
+
+      if (hours > 0) {
+        return `${hours}h ${minutes % 60}m`;
+      } else if (minutes > 0) {
+        return `${minutes}m ${seconds % 60}s`;
+      } else {
+        return `${seconds}s`;
+      }
+    }
+
+    function formatTimeAgo(timestamp) {
+      const seconds = Math.floor((Date.now() - timestamp) / 1000);
+      if (seconds < 5) return 'now';
+      if (seconds < 60) return `${seconds}s ago`;
+      const minutes = Math.floor(seconds / 60);
+      return `${minutes}m ago`;
+    }
+
+    // Clean up SSE before page unload
+    window.addEventListener('pagehide', () => {
+      if (eventSource) {
+        eventSource.close();
+      }
+    });
+
+    // Start connection
+    connect();
+  </script>
+</body>
+
+</html>

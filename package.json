@@ -1,0 +1,14 @@
+{
+    "name": "polar-hub",
+    "version": "1.0.0",
+    "description": "Polar Hub - central aggregation server for HRV data",
+    "type": "module",
+    "scripts": {
+        "server": "node src/server.js",
+        "server:debug": "node src/server.js --log-requests"
+    },
+    "dependencies": {
+        "express": "^4.18.2",
+        "influx": "^5.12.0"
+    }
+}
