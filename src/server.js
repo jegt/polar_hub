@@ -37,6 +37,14 @@ const SESSION_WARMUP_BEATS = 10;
 const influx = createInfluxClient();
 const writers = createHRVWriters(influx, log);
 
+// Events that get persisted to InfluxDB (category.event); everything else is log-only
+const PERSIST_EVENTS = new Set([
+  'ble.connected', 'ble.disconnected', 'ble.pmd_locked',
+  'session.recording', 'session.download_complete', 'session.error',
+  'stream.hr_interrupted', 'stream.hr_recovered',
+  'upload.server_online', 'upload.server_offline'
+]);
+
 // Per-device state
 const deviceState = new Map();
 
@@ -457,29 +465,39 @@ app.post('/posture', async (req, res) => {
 });
 
 /**
- * POST /status - Receive relay status events
+ * POST /status - Receive status events from relays and iOS app
  */
 app.post('/status', async (req, res) => {
-  const { source, device, event, rssi } = req.body;
+  const { source, device, category, event, description, fields } = req.body;
 
-  if (!source || !event) {
-    return res.status(400).json({ ok: false, error: 'Invalid request' });
+  if (!category || !event) {
+    return res.status(400).json({ ok: false, error: 'category and event are required' });
   }
 
-  log(`Relay ${source}: ${event}${rssi !== null ? ` (RSSI: ${rssi} dBm)` : ''}`);
-  await writers.writeRelayStatus(source, event, rssi);
+  // Log all events
+  const qualifiedName = `${category}.${event}`;
+  const sourceStr = source ? `[${source}] ` : '';
+  const descStr = description ? ` — ${description}` : '';
+  const fieldsStr = fields ? ` ${JSON.stringify(fields)}` : '';
+  log(`${sourceStr}${qualifiedName}${descStr}${fieldsStr}`);
 
-  // Update relay state
-  relayState.set(source, {
-    lastSeen: Date.now(),
-    device,
-    rssi,
-    status: event,
-    lastEvent: event
-  });
+  // Only persist allow-listed events to InfluxDB
+  if (PERSIST_EVENTS.has(qualifiedName)) {
+    await writers.writeRelayStatus(category, event, source, device, fields);
+  }
+
+  // Update relay state (SSE status page sees everything)
+  if (source) {
+    relayState.set(source, {
+      lastSeen: Date.now(),
+      device,
+      status: event,
+      lastEvent: qualifiedName
+    });
+  }
 
   // Reset device state on disconnect
-  if (event === 'disconnected' && device) {
+  if (category === 'ble' && event === 'disconnected' && device) {
     const state = deviceState.get(device);
     if (state && state.summaryRRBuffer.length >= 10) {
       await writeHRVSummary(device);

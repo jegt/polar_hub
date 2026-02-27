@@ -147,7 +147,7 @@ Receive posture transition events from a relay.
 
 ### `POST /status`
 
-Receive relay status events (connect, disconnect, etc.).
+Receive status events from relays and the iOS app. Events are categorised by `category.event`. Only events in the server-side allow-list are persisted to InfluxDB; all others are logged but not stored.
 
 **Request body:**
 
@@ -155,17 +155,27 @@ Receive relay status events (connect, disconnect, etc.).
 {
   "source": "relay-living-room",
   "device": "A0B1C2D3",
+  "category": "ble",
   "event": "connected",
-  "rssi": -55
+  "description": "Connected to Polar H10",
+  "fields": { "rssi": -55 }
 }
 ```
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `source` | string | **yes** | Relay identifier |
+| `source` | string | no | Relay or client identifier |
 | `device` | string | no | Sensor device ID |
-| `event` | string | **yes** | Event name (e.g. `"connected"`, `"disconnected"`) |
-| `rssi` | number | no | Bluetooth signal strength in dBm |
+| `category` | string | **yes** | Event category (e.g. `"ble"`, `"session"`, `"stream"`, `"upload"`) |
+| `event` | string | **yes** | Event name within the category |
+| `description` | string | no | Human-readable description |
+| `fields` | object | no | Arbitrary key/value pairs persisted as InfluxDB fields |
+
+**Persisted events** (written to InfluxDB):
+
+`ble.connected`, `ble.disconnected`, `ble.pmd_locked`, `session.recording`, `session.download_complete`, `session.error`, `stream.hr_interrupted`, `stream.hr_recovered`, `upload.server_online`, `upload.server_offline`
+
+All other `category.event` combinations are logged to stdout only.
 
 **Response:**
 
@@ -173,7 +183,7 @@ Receive relay status events (connect, disconnect, etc.).
 { "ok": true }
 ```
 
-On `"disconnected"` events, the server flushes any pending HRV summary for the device and resets its state.
+On `ble.disconnected` events, the server flushes any pending HRV summary for the device and resets its state.
 
 ---
 

@@ -251,25 +251,21 @@ export function createHRVWriters(influx, log = () => {}) {
   /**
    * Write relay status event
    */
-  async function writeRelayStatus(source, event, rssi = null) {
-    const tags = {
-      source,
-      event
-    };
+  async function writeRelayStatus(category, event, source, device, fields) {
+    const tags = { category, event };
+    if (source) tags.source = source;
+    if (device) tags.device = device;
 
-    const fields = {};
-    if (rssi !== null) {
-      fields.rssi = rssi;
-    } else {
-      fields.rssi = 0; // InfluxDB requires at least one field
-    }
+    const writeFields = (fields && Object.keys(fields).length > 0)
+      ? { ...fields }
+      : { value: 1 };
 
     try {
       await influx.writePoints([
         {
           measurement: 'polar_relay_status',
           tags,
-          fields,
+          fields: writeFields,
           timestamp: new Date()
         }
       ], { precision: 'ms' });
