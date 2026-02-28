@@ -25,7 +25,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 // Configuration
-const PORT = config.port;
+const TEST_MODE = process.argv.includes('--test');
+const PORT = TEST_MODE ? (config.testPort || config.port + 1) : config.port;
 const LOG_REQUESTS = process.argv.includes('--log-requests');
 const GAP_THRESHOLD_MS = 300;
 const REALTIME_WINDOW_SIZE = 60;
@@ -34,7 +35,7 @@ const REALTIME_WINDOW_SIZE = 60;
 const influx = createInfluxClient({
   host: config.influxHost,
   port: config.influxPort,
-  database: config.influxDatabase
+  database: TEST_MODE ? config.influxDatabase + '_test' : config.influxDatabase
 });
 const writers = createWriters(influx, log);
 const postProcessor = createPostProcessor(writers, log, {
@@ -78,7 +79,7 @@ function getDeviceState(device) {
  */
 const logDir = join(__dirname, '..', 'logs');
 mkdirSync(logDir, { recursive: true });
-const logStream = createWriteStream(join(logDir, 'hub.log'), { flags: 'a' });
+const logStream = createWriteStream(join(logDir, TEST_MODE ? 'hub-test.log' : 'hub.log'), { flags: 'a' });
 
 function localTimestamp(date = new Date()) {
   return date.toLocaleString('sv-SE', { hour12: false }).replace(' ', 'T');
@@ -495,5 +496,6 @@ server.listen(PORT, () => {
   log(`Status page available at http://localhost:${PORT}/`);
   log(`Gap-based batch dedup threshold: ${GAP_THRESHOLD_MS}ms`);
   if (LOG_REQUESTS) log(`Request logging enabled`);
+  if (TEST_MODE) log(`TEST MODE: database=${config.influxDatabase}_test, port=${PORT}`);
   postProcessor.start();
 });
