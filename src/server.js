@@ -299,7 +299,7 @@ app.post('/beats/batch', async (req, res) => {
         incomingPoints.push({
           timestamp: ts,
           rr_interval: rr,
-          heart_rate: beat.heartRate ?? null,
+          heart_rate: beat.heartRate || null,
           source,
           path: 'batch'
         });
