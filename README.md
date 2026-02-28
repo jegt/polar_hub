@@ -1,6 +1,6 @@
 # Polar Hub
 
-Central aggregation server for heart rate and HRV data from Polar sensors. Receives real-time beats from Bluetooth relay devices, deduplicates batch uploads from the iOS app, calculates HRV metrics (RMSSD, SDNN, pNN50), and writes everything to InfluxDB.
+Central aggregation server for heart rate and HRV data from Polar sensors. Receives real-time beats from Bluetooth relay devices, deduplicates batch uploads from the iOS app, and writes everything to InfluxDB. Artifact detection uses Lipponen & Tarvainen (2019) dRR pattern classification.
 
 Includes a built-in status page with real-time updates via Server-Sent Events.
 
@@ -37,7 +37,7 @@ All configuration is done via `config.json` in the project root. Copy `config.ex
 
 ### `POST /beats`
 
-Receive real-time heartbeat data from a relay.
+Receive real-time heartbeat data from a relay. Raw RR intervals are written to `polar_raw` and post-processed for artifact correction. A 60-beat sliding window provides real-time HRV for the dashboard.
 
 **Request body:**
 
@@ -58,7 +58,7 @@ Receive real-time heartbeat data from a relay.
 | `source` | string | no | Relay identifier |
 | `device` | string | **yes** | Sensor device ID |
 | `timestamp` | number | no | Unix epoch ms (defaults to server time) |
-| `heartRate` | number | no | Heart rate in bpm |
+| `heartRate` | number | no | Heart rate in bpm (from device) |
 | `rrIntervals` | number[] | **yes** | RR intervals in ms |
 | `posture` | string | no | Current posture (e.g. `"sitting"`, `"standing"`) |
 | `rssi` | number | no | Bluetooth signal strength in dBm |
@@ -73,7 +73,9 @@ Receive real-time heartbeat data from a relay.
 
 ### `POST /beats/batch`
 
-Receive historical beat data from the iOS app. Uses gap-based deduplication: only inserts beats where real-time coverage is missing, then recomputes per-beat RMSSD and 5-minute HRV summaries for the affected range.
+Receive historical beat data from the iOS app. Uses gap-based deduplication: only inserts beats where real-time coverage is missing. Post-processor handles artifact correction and HRV summary computation.
+
+`heartRate` is optional — recorded RR data from the app may not include it.
 
 **Request body:**
 
@@ -89,7 +91,6 @@ Receive historical beat data from the iOS app. Uses gap-based deduplication: onl
     },
     {
       "timestamp": 1709042402000,
-      "heartRate": 63,
       "rrIntervals": [951.17]
     }
   ]
@@ -102,7 +103,7 @@ Receive historical beat data from the iOS app. Uses gap-based deduplication: onl
 | `device` | string | **yes** | Sensor device ID |
 | `beats` | object[] | **yes** | Array of beat objects |
 | `beats[].timestamp` | number | **yes** | Unix epoch ms |
-| `beats[].heartRate` | number | **yes** | Heart rate in bpm |
+| `beats[].heartRate` | number | no | Heart rate in bpm |
 | `beats[].rrIntervals` | number[] | no | RR intervals in ms |
 
 **Response:**
@@ -185,7 +186,7 @@ All other `category.event` combinations are logged to stdout only.
 { "ok": true }
 ```
 
-On `ble.disconnected` events, the server flushes any pending HRV summary for the device and resets its state.
+On `ble.disconnected` events, the server resets device state.
 
 ---
 
@@ -207,9 +208,69 @@ Health check.
 
 ## InfluxDB Measurements
 
-| Measurement | Description |
-|-------------|-------------|
-| `polar_hrv_raw` | Per-beat data: heart rate, RR interval, RMSSD, SDNN, posture, source |
-| `polar_hrv` | 5-minute HRV summaries: RMSSD, SDNN, pNN50, average HR, sample count |
-| `polar_posture` | Posture transition events |
-| `polar_relay_status` | Relay connect/disconnect events |
+### `polar_raw`
+
+Every beat as received, plus post-processed clean values.
+
+| Type | Name | Description |
+|------|------|-------------|
+| Tag | `device` | Sensor device ID |
+| Field | `rr_interval` | Raw RR interval in ms (null for synthetic inserted beats) |
+| Field | `heart_rate` | Device-reported HR (null for batch without HR) |
+| Field | `source` | Relay/client identifier |
+| Field | `path` | `"realtime"` or `"batch"` |
+| Field | `rr_clean` | Corrected RR interval (set by post-processor) |
+| Field | `hr_clean` | `60000 / rr_clean` (set by post-processor) |
+| Field | `artifact_type` | `"none"`, `"ectopic"`, `"missed"`, `"extra"`, `"longshort"`, `"missed_inserted"`, `"extra_absorbed"` |
+
+### `polar_realtime`
+
+Per-beat HRV from the 60-beat sliding window (real-time dashboard data).
+
+| Type | Name | Description |
+|------|------|-------------|
+| Tag | `device` | Sensor device ID |
+| Field | `rmssd` | RMSSD in ms |
+| Field | `sdnn` | SDNN in ms |
+| Field | `pnn50` | pNN50 percentage |
+| Field | `hr` | Average HR over the window |
+
+### `polar_hrv_summary`
+
+5-minute HRV summaries computed from `rr_clean` values.
+
+| Type | Name | Description |
+|------|------|-------------|
+| Tag | `device` | Sensor device ID |
+| Tag | `posture` | Posture during the window (when available) |
+| Field | `rmssd` | RMSSD in ms |
+| Field | `sdnn` | SDNN in ms |
+| Field | `pnn50` | pNN50 percentage |
+| Field | `heart_rate` | Average HR |
+| Field | `sample_count` | Number of clean beats in the window |
+| Field | `artifact_count` | Number of artifacts detected |
+
+### `polar_posture`
+
+Posture transition events.
+
+### `polar_relay_status`
+
+Relay status events (connect, disconnect, etc.).
+
+## Data Pipeline
+
+```
+Client (raw RR) → POST /beats → polar_raw (rr_interval, no filtering)
+                               → 60-beat window → Lipponen → polar_realtime (dashboard HRV)
+
+iOS app → POST /beats/batch → dedup → polar_raw → trigger post-processor
+
+Post-processor (every 60s):
+  → query unprocessed beats + 91-beat context on each side
+  → Lipponen artifact detection & correction
+  → write rr_clean + hr_clean + artifact_type → polar_raw
+  → recompute 5-min summaries → polar_hrv_summary
+```
+
+Post-processed data appears ~2 minutes after ingestion (120s buffer ensures full Lipponen look-ahead context). Real-time dashboard HRV is immediate but uses a smaller 60-beat window.

@@ -1,9 +1,10 @@
 /**
  * Polar Hub Server
- * 
+ *
  * Central aggregation server that receives data from multiple relays,
- * deduplicates, calculates HRV metrics, and writes to InfluxDB.
- * 
+ * deduplicates, and writes to InfluxDB. Artifact detection uses
+ * Lipponen & Tarvainen (2019) dRR pattern detection.
+ *
  * Run with: npm start
  */
 
@@ -13,8 +14,10 @@ import { createWriteStream, mkdirSync } from 'fs';
 import { readFile } from 'fs/promises';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
-import { calculateHRV, createRRValidator, createRRBuffer } from './hrv.js';
-import { createInfluxClient, createHRVWriters } from './influx.js';
+import { calculateHRV } from './hrv.js';
+import { analyzeRR } from './lipponen.js';
+import { createInfluxClient, createWriters } from './influx.js';
+import { createPostProcessor } from './postprocessor.js';
 import config from './config.js';
 
 // Get directory path for serving static files
@@ -23,16 +26,9 @@ const __dirname = dirname(__filename);
 
 // Configuration
 const PORT = config.port;
-const HRV_SUMMARY_INTERVAL_MS = config.hrvSummaryIntervalMs;
 const LOG_REQUESTS = process.argv.includes('--log-requests');
 const GAP_THRESHOLD_MS = 300;
-
-// Artifact filtering
-const RR_MIN_MS = 300;
-const RR_MAX_MS = 2000;
-const RR_MAX_DIFF_MS = 200;
-const RR_MAX_DIFF_PCT = 0.20;
-const SESSION_WARMUP_BEATS = 10;
+const REALTIME_WINDOW_SIZE = 60;
 
 // Create components
 const influx = createInfluxClient({
@@ -40,7 +36,10 @@ const influx = createInfluxClient({
   port: config.influxPort,
   database: config.influxDatabase
 });
-const writers = createHRVWriters(influx, log);
+const writers = createWriters(influx, log);
+const postProcessor = createPostProcessor(writers, log, {
+  summaryIntervalMs: config.hrvSummaryIntervalMs
+});
 
 // Events that get persisted to InfluxDB (category.event); everything else is log-only
 const PERSIST_EVENTS = new Set([
@@ -63,19 +62,13 @@ const latestBeatData = new Map();
 function getDeviceState(device) {
   if (!deviceState.has(device)) {
     deviceState.set(device, {
-      rrBuffer: createRRBuffer(30),
-      rmssdBuffer: [],  // Rolling buffer of last 30 RMSSD values for visualization
-      summaryRRBuffer: [],  // {timestamp, rr} pairs for 5-min summaries
+      rrWindow: [],       // last 60 raw RR values for real-time Lipponen
+      rmssdBuffer: [],    // last 30 RMSSD values for visualization
       totalBeats: 0,
-      lastPosture: 'unknown',
-      isValidRR: createRRValidator({
-        minMs: RR_MIN_MS,
-        maxMs: RR_MAX_MS,
-        maxDiffMs: RR_MAX_DIFF_MS,
-        maxDiffPct: RR_MAX_DIFF_PCT,
-        warmupBeats: SESSION_WARMUP_BEATS
-      })
+      lastPosture: 'unknown'
     });
+    // Register with post-processor
+    postProcessor.registerDevice(device);
   }
   return deviceState.get(device);
 }
@@ -97,34 +90,6 @@ function log(message) {
   logStream.write(line + '\n');
 }
 
-/**
- * Write HRV summary for a device
- */
-async function writeHRVSummary(device) {
-  const state = deviceState.get(device);
-  if (!state || state.summaryRRBuffer.length < 10) {
-    return;
-  }
-
-  // Sort by timestamp and extract RR values
-  const sortedRRs = state.summaryRRBuffer
-    .sort((a, b) => a.timestamp - b.timestamp)
-    .map(e => e.rr);
-  
-  const hrv = calculateHRV(sortedRRs);
-  const avgHR = Math.round(60000 / (sortedRRs.reduce((a, b) => a + b, 0) / sortedRRs.length));
-  
-  await writers.writeSummary(hrv, avgHR, sortedRRs.length, state.lastPosture);
-  state.summaryRRBuffer = [];
-}
-
-// HRV summary timer
-setInterval(async () => {
-  for (const device of deviceState.keys()) {
-    await writeHRVSummary(device);
-  }
-}, HRV_SUMMARY_INTERVAL_MS);
-
 // Express app
 const app = express();
 const server = createServer(app);
@@ -142,9 +107,8 @@ function buildStatusPayload() {
     devices[deviceId] = {
       totalBeats: state.totalBeats,
       posture: state.lastPosture,
-      rrBuffer: state.rrBuffer.getAll(),
+      rrBuffer: state.rrWindow.slice(-30),
       rmssdBuffer: state.rmssdBuffer,
-      summaryBufferSize: state.summaryRRBuffer.length,
       ...beatData
     };
   }
@@ -171,7 +135,7 @@ function buildStatusPayload() {
  */
 function broadcastStatus() {
   if (sseClients.size === 0) return;
-  
+
   const payload = JSON.stringify(buildStatusPayload());
   for (const client of sseClients) {
     client.write(`data: ${payload}\n\n`);
@@ -199,7 +163,11 @@ if (LOG_REQUESTS) {
 }
 
 /**
- * POST /beats - Receive heartbeat data from relay
+ * POST /beats - Receive heartbeat data from relay (real-time path)
+ *
+ * Writes raw RR to polar_raw, runs Lipponen on 60-beat window for
+ * real-time HRV, writes to polar_realtime. Post-processor handles
+ * definitive rr_clean values later.
  */
 app.post('/beats', async (req, res) => {
   const { source, device, timestamp, heartRate, rrIntervals, posture, rssi } = req.body;
@@ -217,66 +185,79 @@ app.post('/beats', async (req, res) => {
 
   const beatTimestamp = timestamp || Date.now();
 
-  // Process each RR interval
+  // Write each RR to polar_raw and push to real-time window
   let cumulativeRR = 0;
   for (let i = 0; i < rrIntervals.length; i++) {
     const rr = rrIntervals[i];
     const rrTimestamp = beatTimestamp + cumulativeRR;
     cumulativeRR += rr;
-    
+
     state.totalBeats++;
-    
-    // Get previous RR by timestamp for artifact validation
-    const previousRR = state.rrBuffer.getPreviousByTimestamp(rrTimestamp);
-    const valid = state.isValidRR(rr, previousRR, state.totalBeats);
-    
-    if (valid) {
-      state.rrBuffer.push(rr, rrTimestamp);
-      state.summaryRRBuffer.push({ timestamp: rrTimestamp, rr });
+
+    // Write raw beat to InfluxDB (no filtering — raw as received)
+    writers.writeRawBeat(device, rrTimestamp, rr, heartRate, source, 'realtime');
+
+    // Push to real-time window
+    state.rrWindow.push(rr);
+    if (state.rrWindow.length > REALTIME_WINDOW_SIZE) {
+      state.rrWindow.shift();
     }
-
-    const hrv = calculateHRV(state.rrBuffer.getAll());
-
-    // Track RMSSD values for visualization (only when valid)
-    if (valid && hrv.rmssd !== null) {
-      state.rmssdBuffer.push(hrv.rmssd);
-      if (state.rmssdBuffer.length > 30) {
-        state.rmssdBuffer.shift();
-      }
-    }
-
-    // Always store raw beats — artifact filter only gates HRV calculation
-    writers.writeRaw(device, beatTimestamp, heartRate, rr, hrv, posture, source);
-
-    // Store latest beat data for WebSocket broadcast
-    latestBeatData.set(device, {
-      heartRate,
-      rr,
-      hrv,
-      rssi,
-      source,
-      timestamp: beatTimestamp,
-      valid
-    });
-
-    // Update relay state
-    if (source) {
-      relayState.set(source, {
-        lastSeen: Date.now(),
-        device,
-        rssi,
-        status: 'active'
-      });
-    }
-
-    // Log
-    const artifact = valid ? '' : ' [ART]';
-    const hrvStr = hrv.rmssd !== null ? `RMSSD=${hrv.rmssd}` : 'RMSSD=-';
-    const postureStr = posture && posture !== 'unknown' ? ` [${posture}]` : '';
-    const rssiStr = rssi !== null ? ` ${rssi}dBm` : '';
-    const sourceStr = source ? `[${source}] ` : '';
-    log(`${sourceStr}#${state.totalBeats} HR=${heartRate} RR=${rr.toFixed(0)}ms ${hrvStr}${rssiStr}${postureStr}${artifact}`);
   }
+
+  // Run Lipponen on the real-time window for dashboard HRV
+  let hrv = { rmssd: null, sdnn: null, pnn50: null };
+  let windowHR = heartRate;
+
+  if (state.rrWindow.length >= 4) {
+    const analysis = analyzeRR(state.rrWindow);
+    const cleanRRs = analysis.cleanSeries;
+
+    if (cleanRRs.length >= 2) {
+      hrv = calculateHRV(cleanRRs);
+      const meanCleanRR = cleanRRs.reduce((a, b) => a + b, 0) / cleanRRs.length;
+      windowHR = Math.round(60000 / meanCleanRR);
+    }
+  }
+
+  // Write real-time HRV to polar_realtime
+  const lastRRTimestamp = beatTimestamp + cumulativeRR - rrIntervals[rrIntervals.length - 1];
+  writers.writeRealtime(device, lastRRTimestamp, hrv, windowHR);
+
+  // Track RMSSD for visualization
+  if (hrv.rmssd !== null) {
+    state.rmssdBuffer.push(hrv.rmssd);
+    if (state.rmssdBuffer.length > 30) {
+      state.rmssdBuffer.shift();
+    }
+  }
+
+  // Store latest beat data for SSE broadcast
+  latestBeatData.set(device, {
+    heartRate: windowHR,
+    rr: rrIntervals[rrIntervals.length - 1],
+    hrv,
+    rssi,
+    source,
+    timestamp: lastRRTimestamp
+  });
+
+  // Update relay state
+  if (source) {
+    relayState.set(source, {
+      lastSeen: Date.now(),
+      device,
+      rssi,
+      status: 'active'
+    });
+  }
+
+  // Log
+  const rr = rrIntervals[rrIntervals.length - 1];
+  const hrvStr = hrv.rmssd !== null ? `RMSSD=${hrv.rmssd}` : 'RMSSD=-';
+  const postureStr = posture && posture !== 'unknown' ? ` [${posture}]` : '';
+  const rssiStr = rssi != null ? ` ${rssi}dBm` : '';
+  const sourceStr = source ? `[${source}] ` : '';
+  log(`${sourceStr}#${state.totalBeats} HR=${windowHR} RR=${rr.toFixed(0)}ms ${hrvStr}${rssiStr}${postureStr}`);
 
   // Broadcast status update to SSE clients
   broadcastStatus();
@@ -286,9 +267,10 @@ app.post('/beats', async (req, res) => {
 
 /**
  * POST /beats/batch - Receive historical beat data from iOS app
- * Deduplicates using gap detection: finds gaps in existing data via ts+rr prediction,
- * only inserts batch beats where real-time coverage is missing.
- * Then recomputes per-beat RMSSD and 5-min HRV summaries.
+ *
+ * Deduplicates using gap detection, writes raw beats to polar_raw,
+ * triggers post-processor for artifact correction.
+ * heartRate is optional — batch uploads from recorded RR data may not have it.
  */
 app.post('/beats/batch', async (req, res) => {
   const { source, device, beats } = req.body;
@@ -297,26 +279,39 @@ app.post('/beats/batch', async (req, res) => {
     return res.status(400).json({ ok: false, error: 'Require device and non-empty beats array' });
   }
 
+  // Validate: each beat needs at least a timestamp
   for (let i = 0; i < beats.length; i++) {
     const beat = beats[i];
-    if (typeof beat.timestamp !== 'number' || typeof beat.heartRate !== 'number') {
-      return res.status(400).json({ ok: false, error: `Beat ${i} missing timestamp or heartRate` });
+    if (typeof beat.timestamp !== 'number') {
+      return res.status(400).json({ ok: false, error: `Beat ${i} missing timestamp` });
     }
   }
 
-  // Flatten incoming beats to individual RR points
+  // Ensure device is registered with post-processor
+  await postProcessor.registerDevice(device);
+
+  // Flatten incoming beats to individual RR points (skip beats without rrIntervals)
   const incomingPoints = [];
   for (const beat of beats) {
     if (beat.rrIntervals && beat.rrIntervals.length > 0) {
       let ts = beat.timestamp;
       for (const rr of beat.rrIntervals) {
-        incomingPoints.push({ timestamp: ts, rr_interval: rr, heart_rate: beat.heartRate });
+        incomingPoints.push({
+          timestamp: ts,
+          rr_interval: rr,
+          heart_rate: beat.heartRate ?? null,
+          source,
+          path: 'batch'
+        });
         ts += rr;
       }
-    } else {
-      incomingPoints.push({ timestamp: beat.timestamp, rr_interval: null, heart_rate: beat.heartRate });
     }
   }
+
+  if (incomingPoints.length === 0) {
+    return res.json({ ok: true, received: 0, new: 0, duplicates: 0 });
+  }
+
   incomingPoints.sort((a, b) => a.timestamp - b.timestamp);
 
   const firstTs = incomingPoints[0].timestamp;
@@ -334,32 +329,29 @@ app.post('/beats/batch', async (req, res) => {
   let newPoints;
 
   if (existing.length === 0) {
-    // No existing beats — entire range is a gap, write everything
     newPoints = incomingPoints;
   } else {
-    // Find gaps between consecutive existing beats
     const gaps = [];
     for (let i = 0; i < existing.length - 1; i++) {
-      const expectedNext = existing[i].time + existing[i].rr_interval;
+      const expectedNext = existing[i].time + (existing[i].rr_interval || 0);
       const actualNext = existing[i + 1].time;
       if (actualNext - expectedNext > GAP_THRESHOLD_MS) {
         gaps.push({ start: expectedNext, end: actualNext });
       }
     }
 
-    // Leading edge: batch beats before first existing beat
+    // Leading edge
     if (firstTs < existing[0].time - GAP_THRESHOLD_MS) {
       gaps.unshift({ start: firstTs, end: existing[0].time });
     }
 
-    // Trailing edge: batch beats after last existing beat
+    // Trailing edge
     const lastEx = existing[existing.length - 1];
-    const trailingStart = lastEx.time + lastEx.rr_interval;
+    const trailingStart = lastEx.time + (lastEx.rr_interval || 0);
     if (lastTs > trailingStart + GAP_THRESHOLD_MS) {
       gaps.push({ start: trailingStart, end: lastTs + 2000 });
     }
 
-    // Keep only incoming beats that fall within a gap
     newPoints = incomingPoints.filter(p =>
       gaps.some(g => p.timestamp >= g.start - GAP_THRESHOLD_MS
                   && p.timestamp <= g.end + GAP_THRESHOLD_MS));
@@ -367,88 +359,16 @@ app.post('/beats/batch', async (req, res) => {
 
   const duplicateCount = incomingPoints.length - newPoints.length;
 
-  // Write new points to InfluxDB
+  // Write new points to polar_raw
   if (newPoints.length > 0) {
     try {
-      const writeablePoints = newPoints.map(p => {
-        const fields = { heart_rate: p.heart_rate, path: 'batch' };
-        if (p.rr_interval !== null) fields.rr_interval = p.rr_interval;
-        if (source) fields.source = source;
-        return { fields, timestamp: p.timestamp };
-      });
-      await writers.writeFields(device, writeablePoints);
+      await writers.writeRawBatch(device, newPoints);
     } catch (err) {
       return res.status(500).json({ ok: false, error: 'InfluxDB write failed' });
     }
 
-    // Recompute per-beat RMSSD for affected range
-    try {
-      const seedBeats = await writers.queryBeatsBefore(device, firstTs, 30);
-      const windowBeats = await writers.queryRawBeats(device, firstTs, lastTs);
-      const tailBeats = await writers.queryBeatsAfter(device, lastTs, 30);
-      const allBeats = [...seedBeats, ...windowBeats, ...tailBeats];
-
-      if (allBeats.length >= 2) {
-        const rrBuffer = [];
-        const updates = [];
-
-        for (const beat of allBeats) {
-          // Skip artifact beats (same thresholds as real-time filter)
-          if (beat.rr_interval < RR_MIN_MS || beat.rr_interval > RR_MAX_MS) continue;
-
-          rrBuffer.push(beat.rr_interval);
-          if (rrBuffer.length > 30) rrBuffer.shift();
-
-          // Only update beats from firstTs onward (seed beats untouched)
-          if (beat.time >= firstTs && rrBuffer.length >= 2) {
-            const hrv = calculateHRV([...rrBuffer]);
-            if (hrv.rmssd !== null) {
-              updates.push({
-                fields: { rmssd: hrv.rmssd, sdnn: hrv.sdnn },
-                timestamp: beat.time
-              });
-            }
-          }
-        }
-
-        if (updates.length > 0) {
-          await writers.writeFields(device, updates);
-          log(`Batch RMSSD: recomputed ${updates.length} beats`);
-        }
-      }
-    } catch (err) {
-      log(`RMSSD recomputation failed: ${err.message}`);
-    }
-
-    // Recompute 5-min HRV summaries for affected windows
-    try {
-      const firstWindowStart = Math.floor(firstTs / HRV_SUMMARY_INTERVAL_MS) * HRV_SUMMARY_INTERVAL_MS;
-      const lastWindowEnd = (Math.floor(lastTs / HRV_SUMMARY_INTERVAL_MS) + 1) * HRV_SUMMARY_INTERVAL_MS;
-      const allRR = await writers.queryRawBeats(device, firstWindowStart, lastWindowEnd);
-
-      const windows = new Map();
-      for (const beat of allRR) {
-        if (beat.rr_interval < RR_MIN_MS || beat.rr_interval > RR_MAX_MS) continue;
-        const windowKey = Math.floor(beat.time / HRV_SUMMARY_INTERVAL_MS) * HRV_SUMMARY_INTERVAL_MS;
-        if (!windows.has(windowKey)) windows.set(windowKey, []);
-        windows.get(windowKey).push(beat.rr_interval);
-      }
-
-      let summariesWritten = 0;
-      for (const [windowStart, rrValues] of windows) {
-        if (rrValues.length < 10) continue;
-        const hrv = calculateHRV(rrValues);
-        if (hrv.rmssd === null) continue;
-        const avgHR = Math.round(60000 / (rrValues.reduce((a, b) => a + b, 0) / rrValues.length));
-        await writers.writeSummary(hrv, avgHR, rrValues.length, null, windowStart + HRV_SUMMARY_INTERVAL_MS);
-        summariesWritten++;
-      }
-      if (summariesWritten > 0) {
-        log(`Batch HRV: wrote ${summariesWritten} summaries`);
-      }
-    } catch (err) {
-      log(`Summary recomputation failed: ${err.message}`);
-    }
+    // Trigger post-processor to reprocess from the batch start
+    postProcessor.triggerReprocess(device, firstTs);
   }
 
   // Log
@@ -509,10 +429,6 @@ app.post('/status', async (req, res) => {
 
   // Reset device state on disconnect
   if (category === 'ble' && event === 'disconnected' && device) {
-    const state = deviceState.get(device);
-    if (state && state.summaryRRBuffer.length >= 10) {
-      await writeHRVSummary(device);
-    }
     deviceState.delete(device);
     latestBeatData.delete(device);
   }
@@ -544,7 +460,6 @@ app.get('/', async (req, res) => {
  * GET /events - Server-Sent Events endpoint for real-time status updates
  */
 app.get('/events', (req, res) => {
-  // Set SSE headers
   res.set({
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -552,15 +467,12 @@ app.get('/events', (req, res) => {
   });
   res.flushHeaders();
 
-  // Add client to set
   sseClients.add(res);
   log(`SSE client connected (total: ${sseClients.size})`);
 
-  // Send initial status
   const payload = JSON.stringify(buildStatusPayload());
   res.write(`data: ${payload}\n\n`);
 
-  // Remove client on disconnect
   req.on('close', () => {
     sseClients.delete(res);
     log(`SSE client disconnected (total: ${sseClients.size})`);
@@ -577,11 +489,11 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Start server
+// Start server and post-processor
 server.listen(PORT, () => {
   log(`Polar Hub listening on port ${PORT}`);
-  log(`HRV summary interval: ${HRV_SUMMARY_INTERVAL_MS / 1000}s`);
   log(`Status page available at http://localhost:${PORT}/`);
   log(`Gap-based batch dedup threshold: ${GAP_THRESHOLD_MS}ms`);
   if (LOG_REQUESTS) log(`Request logging enabled`);
+  postProcessor.start();
 });
