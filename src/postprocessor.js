@@ -120,9 +120,9 @@ export function createPostProcessor(writers, log, { summaryIntervalMs = 300_000 
           hr_clean: Math.round(60000 / halfRR * 100) / 100,
           artifact_type: 'missed'
         });
-        // Inserted beat: timestamp at original + RR/2
+        // Inserted beat: timestamp at original + RR/2 (rounded to integer ms)
         insertedPoints.push({
-          timestamp: beat.time + halfRR,
+          timestamp: Math.round(beat.time + halfRR),
           rr_clean: halfRR,
           artifact_type: 'missed_inserted'
         });

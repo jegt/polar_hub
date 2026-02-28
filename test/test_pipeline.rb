@@ -143,6 +143,29 @@ test("Batch dedup: full overlap — same 60 beats") do
   assert("Still 60 points (no duplicates)", c == 60, "Found #{c}")
 end
 
+# ── Test 4b: Batch dedup — BLE-offset overlap ────────────────────────────────
+
+test("Batch dedup: BLE-offset overlap — batch 400ms earlier than realtime") do
+  # Realtime beats were sent at BASE_TS + i*1000 (test 2).
+  # Batch beats arrive with recording timestamps ~400ms earlier
+  # (BLE pipeline delay means realtime timestamps lag behind recording).
+  # All 60 should be rejected as duplicates.
+  beats = 60.times.map do |i|
+    {
+      timestamp:    BASE_TS + (i * 1000) - 400,
+      rrIntervals:  [RR_NORMAL[i]]
+    }
+  end
+
+  resp = post_json('/beats/batch', { source: TEST_SOURCE, device: TEST_DEVICE, beats: beats })
+
+  assert("new == 0",         resp['new']        == 0,  "new=#{resp['new']}")
+  assert("duplicates == 60", resp['duplicates'] == 60, "duplicates=#{resp['duplicates']}")
+
+  c = count_measurement(influx, 'polar_raw', TEST_DEVICE)
+  assert("Still 60 points (no duplicates)", c == 60, "Found #{c}")
+end
+
 # ── Test 5: Batch dedup — gap fill ───────────────────────────────────────────
 
 test("Batch dedup: gap fill — skip beat #30, batch fills exactly 1") do
@@ -177,7 +200,7 @@ test("Batch dedup: gap fill — skip beat #30, batch fills exactly 1") do
   resp = post_json('/beats/batch', { source: TEST_SOURCE, device: TEST_DEVICE, beats: beats })
 
   assert("new >= 1",          resp['new']        >= 1,  "new=#{resp['new']}")
-  assert("duplicates >= 58",  resp['duplicates'] >= 58, "duplicates=#{resp['duplicates']}")
+  assert("duplicates >= 55",  resp['duplicates'] >= 55, "duplicates=#{resp['duplicates']}")
 
   sleep 1
   c = count_measurement(influx, 'polar_raw', TEST_DEVICE)

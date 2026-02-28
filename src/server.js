@@ -28,7 +28,7 @@ const __dirname = dirname(__filename);
 const TEST_MODE = process.argv.includes('--test');
 const PORT = TEST_MODE ? (config.testPort || config.port + 1) : config.port;
 const LOG_REQUESTS = process.argv.includes('--log-requests');
-const GAP_THRESHOLD_MS = 300;
+const GAP_THRESHOLD_MS = 1000;
 const REALTIME_WINDOW_SIZE = 60;
 
 // Create components
