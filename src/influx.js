@@ -137,13 +137,14 @@ export function createWriters(influx, log = () => {}) {
   /**
    * Write a real-time HRV data point
    */
-  async function writeRealtime(device, timestamp, hrv, hr) {
+  async function writeRealtime(device, timestamp, hrv, hr, posture) {
     const tags = device ? { device } : {};
     const fields = {};
     if (hrv.rmssd != null) fields.rmssd = hrv.rmssd;
     if (hrv.sdnn != null) fields.sdnn = hrv.sdnn;
     if (hrv.pnn50 != null) fields.pnn50 = hrv.pnn50;
     if (hr != null) fields.hr = hr;
+    if (posture && posture !== 'unknown') fields.posture = posture;
 
     if (Object.keys(fields).length === 0) return; // nothing to write
 

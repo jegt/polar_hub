@@ -209,9 +209,24 @@ app.post('/beats', async (req, res) => {
   let hrv = { rmssd: null, sdnn: null, pnn50: null };
   let windowHR = heartRate;
 
-  if (state.rrWindow.length >= 4) {
-    const analysis = analyzeRR(state.rrWindow);
-    const cleanRRs = analysis.cleanSeries;
+  // Iterative Lipponen: run detection + correction on the clean series
+  // repeatedly until the artifact count stops decreasing. This matches
+  // NeuroKit2's iterative mode and handles extreme artifacts (e.g. 2778ms)
+  // that get partially corrected in pass 1 and fully corrected in pass 2+.
+  if (state.rrWindow.length >= 6) {
+    let rr = [...state.rrWindow];
+    let cleanRRs = rr;
+    let prevArtifacts = Infinity;
+
+    for (let pass = 0; pass < 5; pass++) {
+      if (rr.length < 4) break;
+      const analysis = analyzeRR(rr);
+      if (analysis.stats.artifacts >= prevArtifacts) break;
+      prevArtifacts = analysis.stats.artifacts;
+      cleanRRs = analysis.cleanSeries;
+      rr = cleanRRs;
+      if (prevArtifacts === 0) break;
+    }
 
     if (cleanRRs.length >= 2) {
       hrv = calculateHRV(cleanRRs);
@@ -222,7 +237,7 @@ app.post('/beats', async (req, res) => {
 
   // Write real-time HRV to polar_realtime
   const lastRRTimestamp = beatTimestamp + cumulativeRR - rrIntervals[rrIntervals.length - 1];
-  writers.writeRealtime(device, lastRRTimestamp, hrv, windowHR);
+  writers.writeRealtime(device, lastRRTimestamp, hrv, windowHR, posture);
 
   // Track RMSSD for visualization
   if (hrv.rmssd !== null) {
