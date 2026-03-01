@@ -228,6 +228,10 @@ app.post('/beats', async (req, res) => {
       if (prevArtifacts === 0) break;
     }
 
+    // Exclude last 2: Lipponen's loop (i < n-2) never classifies them.
+    // They'll be classified once 2 more beats push them into range.
+    cleanRRs = cleanRRs.slice(0, -2);
+
     if (cleanRRs.length >= 2) {
       hrv = calculateHRV(cleanRRs);
       const meanCleanRR = cleanRRs.reduce((a, b) => a + b, 0) / cleanRRs.length;
