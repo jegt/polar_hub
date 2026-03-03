@@ -97,8 +97,28 @@ export function createPostProcessor(writers, log, { summaryIntervalMs = 300_000 
       return;
     }
 
-    // Run Lipponen on the full array
-    const analysis = analyzeRR(fullRR);
+    // Iterative Lipponen: first pass detects and classifies artifacts,
+    // then iterate on corrected values until artifact count converges.
+    // First pass results are used for artifact_type (classification),
+    // refined values are used for rr_clean (best correction).
+    const firstAnalysis = analyzeRR(fullRR);
+    let rr = firstAnalysis.results.map((r, i) =>
+      r.rr_clean != null && r.rr_clean > 0 ? r.rr_clean : fullRR[i]
+    );
+    let prevArtifacts = firstAnalysis.stats.artifacts;
+
+    if (prevArtifacts > 0) {
+      for (let pass = 0; pass < 20; pass++) {
+        if (rr.length < 4) break;
+        const analysis = analyzeRR(rr);
+        if (analysis.stats.artifacts > prevArtifacts) break;
+        prevArtifacts = analysis.stats.artifacts;
+        if (prevArtifacts === 0) break;
+        rr = analysis.results.map((r, i) =>
+          r.rr_clean != null && r.rr_clean > 0 ? r.rr_clean : rr[i]
+        );
+      }
+    }
 
     // Extract results for target range only (skip left/right context)
     const targetStartIdx = leftRR.length;
@@ -109,24 +129,24 @@ export function createPostProcessor(writers, log, { summaryIntervalMs = 300_000 
 
     for (let i = targetStartIdx; i < targetEndIdx; i++) {
       const beat = targetWithRR[i - targetStartIdx];
-      const result = analysis.results[i];
+      const classification = firstAnalysis.results[i];
+      const refinedRR = rr[i];
 
-      if (result.artifact_type === 'missed') {
-        // Original beat: rr_clean = RR/2
-        const halfRR = result.rr_clean; // already set to rr/2 by analyzeRR
+      if (classification.artifact_type === 'missed') {
+        // refinedRR is already rr/2 from first pass correction
         cleanPoints.push({
           timestamp: beat.time,
-          rr_clean: halfRR,
-          hr_clean: Math.round(60000 / halfRR * 100) / 100,
+          rr_clean: refinedRR,
+          hr_clean: Math.round(60000 / refinedRR * 100) / 100,
           artifact_type: 'missed'
         });
         // Inserted beat: timestamp at original + RR/2 (rounded to integer ms)
         insertedPoints.push({
-          timestamp: Math.round(beat.time + halfRR),
-          rr_clean: halfRR,
+          timestamp: Math.round(beat.time + refinedRR),
+          rr_clean: refinedRR,
           artifact_type: 'missed_inserted'
         });
-      } else if (result.artifact_type === 'extra_absorbed') {
+      } else if (classification.artifact_type === 'extra_absorbed') {
         // Absorbed: rr_clean=0 (sentinel), artifact_type marks it
         cleanPoints.push({
           timestamp: beat.time,
@@ -134,13 +154,13 @@ export function createPostProcessor(writers, log, { summaryIntervalMs = 300_000 
           hr_clean: 0,
           artifact_type: 'extra_absorbed'
         });
-      } else if (result.rr_clean != null) {
-        // Normal, ectopic, extra (merged), longshort — all have a corrected value
+      } else if (refinedRR > 0) {
+        // Normal, ectopic, extra (merged), longshort — use refined correction
         cleanPoints.push({
           timestamp: beat.time,
-          rr_clean: result.rr_clean,
-          hr_clean: Math.round(60000 / result.rr_clean * 100) / 100,
-          artifact_type: result.artifact_type
+          rr_clean: refinedRR,
+          hr_clean: Math.round(60000 / refinedRR * 100) / 100,
+          artifact_type: classification.artifact_type
         });
       }
     }
@@ -156,7 +176,7 @@ export function createPostProcessor(writers, log, { summaryIntervalMs = 300_000 
     }
 
     // Log results
-    const targetResults = analysis.results.slice(targetStartIdx, targetEndIdx);
+    const targetResults = firstAnalysis.results.slice(targetStartIdx, targetEndIdx);
     const artifactCount = targetResults.filter(r => r.artifact_type !== 'none').length;
     if (artifactCount > 0 || targetRR.length > 0) {
       log(`Post-processor: ${device.slice(0, 11)} | ${targetRR.length} beats, ${artifactCount} artifacts, ${insertedPoints.length} inserted`);

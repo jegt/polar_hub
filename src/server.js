@@ -185,6 +185,7 @@ app.post('/beats', async (req, res) => {
   state.lastPosture = posture || 'unknown';
 
   const beatTimestamp = timestamp || Date.now();
+  const tsFromApp = !!timestamp;
 
   // Write each RR to polar_raw and push to real-time window
   let cumulativeRR = 0;
@@ -210,27 +211,26 @@ app.post('/beats', async (req, res) => {
   let windowHR = heartRate;
 
   // Iterative Lipponen: run detection + correction on the clean series
-  // repeatedly until the artifact count stops decreasing. This matches
-  // NeuroKit2's iterative mode and handles extreme artifacts (e.g. 2778ms)
-  // that get partially corrected in pass 1 and fully corrected in pass 2+.
+  // repeatedly until the artifact count stops decreasing (NeuroKit2 style).
   if (state.rrWindow.length >= 6) {
     let rr = [...state.rrWindow];
     let cleanRRs = rr;
     let prevArtifacts = Infinity;
 
-    for (let pass = 0; pass < 5; pass++) {
+    for (let pass = 0; pass < 20; pass++) {
       if (rr.length < 4) break;
       const analysis = analyzeRR(rr);
-      if (analysis.stats.artifacts >= prevArtifacts) break;
+      if (analysis.stats.artifacts > prevArtifacts) break;
       prevArtifacts = analysis.stats.artifacts;
       cleanRRs = analysis.cleanSeries;
       rr = cleanRRs;
       if (prevArtifacts === 0) break;
     }
 
-    // Exclude last 2: Lipponen's loop (i < n-2) never classifies them.
-    // They'll be classified once 2 more beats push them into range.
-    cleanRRs = cleanRRs.slice(0, -2);
+    // Exclude edges that Lipponen can't classify:
+    // - First beat: dRR[0] = mean(dRR[1:]) masks artifacts at position 0
+    // - Last 2 beats: classification loop (i < n-2) never reaches them
+    cleanRRs = cleanRRs.slice(1, -2);
 
     if (cleanRRs.length >= 2) {
       hrv = calculateHRV(cleanRRs);
@@ -277,7 +277,10 @@ app.post('/beats', async (req, res) => {
   const postureStr = posture && posture !== 'unknown' ? ` [${posture}]` : '';
   const rssiStr = rssi != null ? ` ${rssi}dBm` : '';
   const sourceStr = source ? `[${source}] ` : '';
-  log(`${sourceStr}#${state.totalBeats} HR=${windowHR} RR=${rr.toFixed(0)}ms ${hrvStr}${rssiStr}${postureStr}`);
+  const lagMs = Date.now() - beatTimestamp;
+  const tsStr = tsFromApp ? ` ts=${beatTimestamp}` : ' ts=N/A';
+  const lagStr = tsFromApp ? ` lag=${lagMs}ms` : '';
+  log(`${sourceStr}#${state.totalBeats} HR=${windowHR} RR=${rr.toFixed(0)}ms ${hrvStr}${rssiStr}${postureStr}${tsStr}${lagStr}`);
 
   // Broadcast status update to SSE clients
   broadcastStatus();
@@ -396,6 +399,14 @@ app.post('/beats/batch', async (req, res) => {
   const deviceShort = device.length > 11 ? device.slice(0, 11) + '...' : device;
   const fmt = ts => localTimestamp(new Date(ts)).slice(11, 19);
   log(`Batch: ${incomingPoints.length} beats, ${newPoints.length} new, ${duplicateCount} dupes from ${source || 'unknown'} for ${deviceShort} | ${fmt(firstTs)} → ${fmt(lastTs)} (${durationMin}min)`);
+  if (incomingPoints.length <= 10) {
+    const now = Date.now();
+    for (const p of incomingPoints) {
+      const age = ((now - p.timestamp) / 1000).toFixed(1);
+      const origin = p.heart_rate ? 'buf' : 'rec';
+      log(`  ts=${p.timestamp} RR=${p.rr_interval}ms (${age}s ago) [${origin}]`);
+    }
+  }
 
   res.json({ ok: true, received: incomingPoints.length, new: newPoints.length, duplicates: duplicateCount });
 });
