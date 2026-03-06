@@ -19,6 +19,7 @@ INFLUX_DB   = ENV.fetch('INFLUX_DB',    'home_test')
 TEST_DEVICE = 'TEST:DE:VI:CE:00:01'
 TEST_SOURCE = 'test-script'
 TEST_SESSION_ID = 'test-session-001'
+TEST_POSTURE_SOURCE = 'test-posture-source'
 
 influx = InfluxDB::Client.new(
   host: INFLUX_HOST,
@@ -101,6 +102,7 @@ test("Clean slate") do
   influx.query("DELETE FROM polar_hrv_summary WHERE \"device\" = '#{TEST_DEVICE}'") rescue nil
   influx.query("DELETE FROM polar_quality_1m WHERE \"device\" = '#{TEST_DEVICE}'") rescue nil
   influx.query("DELETE FROM polar_upload_receipts WHERE \"device\" = '#{TEST_DEVICE}'") rescue nil
+  influx.query("DELETE FROM polar_posture WHERE \"source\" = '#{TEST_POSTURE_SOURCE}'") rescue nil
   sleep 0.5
 
   c = count_measurement(influx, 'polar_raw', TEST_DEVICE)
@@ -168,6 +170,40 @@ test("Real-time: validation rejects missing rrInterval") do
   assert("Request rejected", resp['ok'] == false, "ok=#{resp['ok']}")
   has_msg = resp['error'].is_a?(String) && resp['error'].include?('rrInterval')
   assert("Error mentions rrInterval", has_msg, "error=#{resp['error']}")
+end
+
+# ── Test 3c: Posture endpoint optional confidence ────────────────────────────
+
+test("Posture: /posture writes row when confidence is omitted") do
+  resp = post_json('/posture', {
+    source: TEST_POSTURE_SOURCE,
+    device: TEST_DEVICE,
+    fromPosture: 'lying_back',
+    toPosture: 'upright',
+    fromDurationSeconds: 29.73
+  })
+
+  assert("Posture request accepted", resp['ok'] == true, "resp=#{resp}")
+
+  sleep 1
+  r = influx.query(
+    "SELECT from_posture, to_posture, from_duration_seconds, confidence " \
+    "FROM polar_posture WHERE \"source\" = '#{TEST_POSTURE_SOURCE}' ORDER BY time DESC LIMIT 1"
+  )
+  rows = (r.empty? || r.first['values'].nil?) ? [] : r.first['values']
+  assert("One posture transition written", rows.length == 1, "rows=#{rows.length}")
+
+  if rows.length == 1
+    row = rows[0]
+    assert("Transition is lying_back -> upright",
+           row['from_posture'] == 'lying_back' && row['to_posture'] == 'upright',
+           "row=#{row}")
+    duration = row['from_duration_seconds']
+    assert("Duration is persisted", duration && (duration - 29.73).abs < 0.001,
+           "duration=#{duration.inspect}")
+    assert("Confidence remains null when omitted", row['confidence'].nil?,
+           "confidence=#{row['confidence'].inspect}")
+  end
 end
 
 # ── Test 4: Batch dedup — full overlap ───────────────────────────────────────
@@ -1092,10 +1128,21 @@ test("Cleanup") do
   influx.query("DELETE FROM polar_realtime WHERE \"device\" = '#{TEST_DEVICE}'")
   influx.query("DELETE FROM polar_hrv_summary WHERE \"device\" = '#{TEST_DEVICE}'")
   influx.query("DELETE FROM polar_quality_1m WHERE \"device\" = '#{TEST_DEVICE}'")
+  influx.query("DELETE FROM polar_posture WHERE \"source\" = '#{TEST_POSTURE_SOURCE}'")
   sleep 0.5
 
   c = count_measurement(influx, 'polar_raw', TEST_DEVICE)
   assert("All test data cleaned up", c == 0, "Found #{c} remaining points")
+  posture = influx.query(
+    "SELECT count(from_duration_seconds) FROM polar_posture WHERE \"source\" = '#{TEST_POSTURE_SOURCE}'"
+  )
+  posture_count = if posture.empty? || posture.first['values'].nil?
+                    0
+                  else
+                    posture.first['values'].first['count']
+                  end
+  assert("All posture test data cleaned up", posture_count == 0,
+         "Found #{posture_count} remaining transitions")
 end
 
 # ── Results ──────────────────────────────────────────────────────────────────

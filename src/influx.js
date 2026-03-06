@@ -679,15 +679,22 @@ export function createWriters(influx, log = () => {}) {
   async function writePostureTransition(fromPosture, toPosture, fromDurationSeconds, confidence, source = null) {
     const tags = { from_posture: fromPosture, to_posture: toPosture };
     if (source) tags.source = source;
+    const fields = {};
+    if (fromDurationSeconds != null) fields.from_duration_seconds = fromDurationSeconds;
+    if (confidence != null) fields.confidence = confidence;
+    if (Object.keys(fields).length === 0) fields.value = 1;
 
     try {
       await influx.writePoints([{
         measurement: 'polar_posture',
         tags,
-        fields: { from_duration_seconds: fromDurationSeconds, confidence },
+        fields,
         timestamp: new Date()
       }], { precision: 'ms' });
-      log(`Posture: ${fromPosture} -> ${toPosture} (was ${fromDurationSeconds}s, confidence ${confidence})`);
+      const details = [];
+      if (fromDurationSeconds != null) details.push(`was ${fromDurationSeconds}s`);
+      if (confidence != null) details.push(`confidence ${confidence}`);
+      log(`Posture: ${fromPosture} -> ${toPosture}${details.length ? ` (${details.join(', ')})` : ''}`);
     } catch (err) {
       log(`InfluxDB write error (posture): ${err.message}`);
     }
