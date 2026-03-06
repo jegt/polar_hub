@@ -14,6 +14,9 @@ npm-debug.log*
 
 # Config
 config.json
+findings.md
+plan.md
+progress.md
 
 # OS files
 .DS_Store

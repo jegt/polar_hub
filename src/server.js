@@ -29,7 +29,11 @@ const TEST_MODE = process.argv.includes('--test');
 const PORT = TEST_MODE ? (config.testPort || config.port + 1) : config.port;
 const LOG_REQUESTS = process.argv.includes('--log-requests');
 const GAP_THRESHOLD_MS = 1000;
+const RECORDING_DUPLICATE_PROXIMITY_MS = 500;
+const RECORDING_GAP_EDGE_TOLERANCE_MS = 300;
+const REPROCESS_REWIND_MS = 10_000;
 const REALTIME_WINDOW_SIZE = 60;
+const BATCH_TYPES = new Set(['buffered_realtime', 'recording']);
 
 // Create components
 const influx = createInfluxClient({
@@ -89,6 +93,14 @@ function log(message) {
   const line = `[${localTimestamp()}] ${message}`;
   console.log(line);
   logStream.write(line + '\n');
+}
+
+function isFiniteNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function isNonEmptyString(value) {
+  return typeof value === 'string' && value.trim().length > 0;
 }
 
 // Express app
@@ -164,74 +176,97 @@ if (LOG_REQUESTS) {
 }
 
 /**
- * POST /beats - Receive heartbeat data from relay (real-time path)
+ * POST /beats - Receive one realtime heartbeat
  *
- * Writes raw RR to polar_raw, runs Lipponen on 60-beat window for
- * real-time HRV, writes to polar_realtime. Post-processor handles
- * definitive rr_clean values later.
+ * Strict v2 payload:
+ * - one beat per request (`rrInterval`)
+ * - identity key: (`sessionId`, `beatSeq`)
  */
 app.post('/beats', async (req, res) => {
-  const { source, device, timestamp, heartRate, rrIntervals, posture, rssi } = req.body;
+  const {
+    source, device, sessionId, beatSeq, timestamp,
+    heartRate, rrInterval, posture, rssi
+  } = req.body;
 
-  if (!device || !rrIntervals || !Array.isArray(rrIntervals)) {
-    return res.status(400).json({ ok: false, error: 'Invalid request' });
+  if (!isNonEmptyString(device)) {
+    return res.status(400).json({ ok: false, error: 'device is required' });
+  }
+  if (!isNonEmptyString(sessionId)) {
+    return res.status(400).json({ ok: false, error: 'sessionId is required' });
+  }
+  if (!Number.isInteger(beatSeq) || beatSeq < 0) {
+    return res.status(400).json({ ok: false, error: 'beatSeq must be a non-negative integer' });
+  }
+  if (!isFiniteNumber(timestamp)) {
+    return res.status(400).json({ ok: false, error: 'timestamp must be a number' });
+  }
+  if (!isFiniteNumber(rrInterval) || rrInterval <= 0) {
+    return res.status(400).json({ ok: false, error: 'rrInterval must be a positive number' });
+  }
+  if (heartRate != null && !isFiniteNumber(heartRate)) {
+    return res.status(400).json({ ok: false, error: 'heartRate must be a number when provided' });
   }
 
-  if (rrIntervals.length === 0) {
-    return res.json({ ok: true, received: 0 });
+  let existing;
+  try {
+    existing = await writers.queryBeatIdentityExists(device, sessionId, beatSeq);
+  } catch (err) {
+    log(`Realtime dedup lookup failed: ${err.message}`);
+    return res.status(500).json({ ok: false, error: 'Dedup query failed' });
+  }
+
+  if (existing) {
+    return res.json({ ok: true, received: 1, new: 0, duplicates: 1 });
   }
 
   const state = getDeviceState(device);
+  state.totalBeats++;
   state.lastPosture = posture || 'unknown';
 
-  const beatTimestamp = timestamp || Date.now();
-  const tsFromApp = !!timestamp;
+  const beatTimestamp = timestamp;
+  const rr = rrInterval;
+  const hrInstant = Math.round((60000 / rr) * 100) / 100;
 
-  // Write each RR to polar_raw and push to real-time window
-  let cumulativeRR = 0;
-  for (let i = 0; i < rrIntervals.length; i++) {
-    const rr = rrIntervals[i];
-    const rrTimestamp = beatTimestamp + cumulativeRR;
-    cumulativeRR += rr;
+  try {
+    await writers.writeRawBeat(device, {
+      timestamp: beatTimestamp,
+      rr_interval: rr,
+      heart_rate: heartRate ?? null,
+      source,
+      path: 'realtime',
+      session_id: sessionId,
+      beat_seq: beatSeq
+    });
+  } catch {
+    return res.status(500).json({ ok: false, error: 'InfluxDB write failed' });
+  }
 
-    state.totalBeats++;
-
-    // Write raw beat to InfluxDB (no filtering — raw as received)
-    writers.writeRawBeat(device, rrTimestamp, rr, heartRate, source, 'realtime');
-
-    // Push to real-time window
-    state.rrWindow.push(rr);
-    if (state.rrWindow.length > REALTIME_WINDOW_SIZE) {
-      state.rrWindow.shift();
-    }
+  // Push to real-time window
+  state.rrWindow.push(rr);
+  if (state.rrWindow.length > REALTIME_WINDOW_SIZE) {
+    state.rrWindow.shift();
   }
 
   // Run Lipponen on the real-time window for dashboard HRV
   let hrv = { rmssd: null, sdnn: null, pnn50: null };
   let windowHR = heartRate;
 
-  // Iterative Lipponen: run detection + correction on the clean series
-  // repeatedly until the artifact count stops decreasing (NeuroKit2 style).
   if (state.rrWindow.length >= 6) {
-    let rr = [...state.rrWindow];
-    let cleanRRs = rr;
+    let rrSeries = [...state.rrWindow];
+    let cleanRRs = rrSeries;
     let prevArtifacts = Infinity;
 
     for (let pass = 0; pass < 20; pass++) {
-      if (rr.length < 4) break;
-      const analysis = analyzeRR(rr);
+      if (rrSeries.length < 4) break;
+      const analysis = analyzeRR(rrSeries);
       if (analysis.stats.artifacts > prevArtifacts) break;
       prevArtifacts = analysis.stats.artifacts;
       cleanRRs = analysis.cleanSeries;
-      rr = cleanRRs;
+      rrSeries = cleanRRs;
       if (prevArtifacts === 0) break;
     }
 
-    // Exclude edges that Lipponen can't classify:
-    // - First beat: dRR[0] = mean(dRR[1:]) masks artifacts at position 0
-    // - Last 2 beats: classification loop (i < n-2) never reaches them
     cleanRRs = cleanRRs.slice(1, -2);
-
     if (cleanRRs.length >= 2) {
       hrv = calculateHRV(cleanRRs);
       const meanCleanRR = cleanRRs.reduce((a, b) => a + b, 0) / cleanRRs.length;
@@ -239,11 +274,8 @@ app.post('/beats', async (req, res) => {
     }
   }
 
-  // Write real-time HRV to polar_realtime
-  const lastRRTimestamp = beatTimestamp + cumulativeRR - rrIntervals[rrIntervals.length - 1];
-  writers.writeRealtime(device, lastRRTimestamp, hrv, windowHR, posture);
+  await writers.writeRealtime(device, beatTimestamp, hrv, windowHR, posture, hrInstant);
 
-  // Track RMSSD for visualization
   if (hrv.rmssd !== null) {
     state.rmssdBuffer.push(hrv.rmssd);
     if (state.rmssdBuffer.length > 30) {
@@ -251,17 +283,15 @@ app.post('/beats', async (req, res) => {
     }
   }
 
-  // Store latest beat data for SSE broadcast
   latestBeatData.set(device, {
     heartRate: windowHR,
-    rr: rrIntervals[rrIntervals.length - 1],
+    rr,
     hrv,
     rssi,
     source,
-    timestamp: lastRRTimestamp
+    timestamp: beatTimestamp
   });
 
-  // Update relay state
   if (source) {
     relayState.set(source, {
       lastSeen: Date.now(),
@@ -271,144 +301,287 @@ app.post('/beats', async (req, res) => {
     });
   }
 
-  // Log
-  const rr = rrIntervals[rrIntervals.length - 1];
   const hrvStr = hrv.rmssd !== null ? `RMSSD=${hrv.rmssd}` : 'RMSSD=-';
   const postureStr = posture && posture !== 'unknown' ? ` [${posture}]` : '';
   const rssiStr = rssi != null ? ` ${rssi}dBm` : '';
   const sourceStr = source ? `[${source}] ` : '';
   const lagMs = Date.now() - beatTimestamp;
-  const tsStr = tsFromApp ? ` ts=${beatTimestamp}` : ' ts=N/A';
-  const lagStr = tsFromApp ? ` lag=${lagMs}ms` : '';
-  log(`${sourceStr}#${state.totalBeats} HR=${windowHR} RR=${rr.toFixed(0)}ms ${hrvStr}${rssiStr}${postureStr}${tsStr}${lagStr}`);
+  const sessionShort = sessionId.slice(0, 8);
+  log(`${sourceStr}#${state.totalBeats} seq=${sessionShort}:${beatSeq} HR=${windowHR} RR=${rr.toFixed(0)}ms ${hrvStr}${rssiStr}${postureStr} ts=${beatTimestamp} lag=${lagMs}ms`);
 
-  // Broadcast status update to SSE clients
   broadcastStatus();
 
-  res.json({ ok: true, received: rrIntervals.length });
+  res.json({ ok: true, received: 1, new: 1, duplicates: 0 });
 });
 
 /**
  * POST /beats/batch - Receive historical beat data from iOS app
  *
- * Deduplicates using gap detection, writes raw beats to polar_raw,
- * triggers post-processor for artifact correction.
- * heartRate is optional — batch uploads from recorded RR data may not have it.
+ * Strict v2 payload:
+ * - one beat object = one heartbeat (`rrInterval`)
+ * - requires top-level `batchType` + `uploadId`
+ * - buffered realtime dedup: identity key (`sessionId`, `beatSeq`)
+ * - recording dedup: (`recordingId`, `recordingSeq`) + timestamp gap heuristic
  */
 app.post('/beats/batch', async (req, res) => {
-  const { source, device, beats } = req.body;
+  const { source, device, batchType, uploadId, beats } = req.body;
 
-  if (!device || !beats || !Array.isArray(beats) || beats.length === 0) {
-    return res.status(400).json({ ok: false, error: 'Require device and non-empty beats array' });
+  if (!isNonEmptyString(device)) {
+    return res.status(400).json({ ok: false, error: 'device is required' });
+  }
+  if (!BATCH_TYPES.has(batchType)) {
+    return res.status(400).json({ ok: false, error: 'batchType must be buffered_realtime or recording' });
+  }
+  if (!isNonEmptyString(uploadId)) {
+    return res.status(400).json({ ok: false, error: 'uploadId is required' });
+  }
+  if (!Array.isArray(beats) || beats.length === 0) {
+    return res.status(400).json({ ok: false, error: 'beats must be a non-empty array' });
   }
 
-  // Validate: each beat needs at least a timestamp
-  for (let i = 0; i < beats.length; i++) {
-    const beat = beats[i];
-    if (typeof beat.timestamp !== 'number') {
-      return res.status(400).json({ ok: false, error: `Beat ${i} missing timestamp` });
-    }
+  let previousReceipt;
+  try {
+    previousReceipt = await writers.queryUploadReceipt(device, batchType, uploadId);
+  } catch (err) {
+    log(`Upload receipt lookup failed: ${err.message}`);
+    return res.status(500).json({ ok: false, error: 'Upload lookup failed' });
+  }
+  if (previousReceipt) {
+    return res.json({
+      ok: true,
+      replay: true,
+      received: previousReceipt.received,
+      new: previousReceipt.new,
+      duplicates: previousReceipt.duplicates
+    });
   }
 
-  // Ensure device is registered with post-processor
   await postProcessor.registerDevice(device);
 
-  // Flatten incoming beats to individual RR points (skip beats without rrIntervals)
   const incomingPoints = [];
-  for (const beat of beats) {
-    if (beat.rrIntervals && beat.rrIntervals.length > 0) {
-      let ts = beat.timestamp;
-      for (const rr of beat.rrIntervals) {
-        incomingPoints.push({
-          timestamp: ts,
-          rr_interval: rr,
-          heart_rate: beat.heartRate || null,
-          source,
-          path: 'batch'
-        });
-        ts += rr;
+  for (let i = 0; i < beats.length; i++) {
+    const beat = beats[i];
+
+    if (!isFiniteNumber(beat.timestamp)) {
+      return res.status(400).json({ ok: false, error: `Beat ${i} timestamp must be a number` });
+    }
+    if (!isFiniteNumber(beat.rrInterval) || beat.rrInterval <= 0) {
+      return res.status(400).json({ ok: false, error: `Beat ${i} rrInterval must be a positive number` });
+    }
+    if (beat.heartRate != null && !isFiniteNumber(beat.heartRate)) {
+      return res.status(400).json({ ok: false, error: `Beat ${i} heartRate must be a number when provided` });
+    }
+
+    if (batchType === 'buffered_realtime') {
+      if (!isNonEmptyString(beat.sessionId)) {
+        return res.status(400).json({ ok: false, error: `Beat ${i} sessionId is required for buffered_realtime` });
+      }
+      if (!Number.isInteger(beat.beatSeq) || beat.beatSeq < 0) {
+        return res.status(400).json({ ok: false, error: `Beat ${i} beatSeq must be a non-negative integer` });
+      }
+    } else {
+      if (!isNonEmptyString(beat.recordingId)) {
+        return res.status(400).json({ ok: false, error: `Beat ${i} recordingId is required for recording` });
+      }
+      if (!Number.isInteger(beat.recordingSeq) || beat.recordingSeq < 0) {
+        return res.status(400).json({ ok: false, error: `Beat ${i} recordingSeq must be a non-negative integer` });
+      }
+      if (beat.sessionId != null && !isNonEmptyString(beat.sessionId)) {
+        return res.status(400).json({ ok: false, error: `Beat ${i} sessionId must be a non-empty string when provided` });
       }
     }
-  }
 
-  if (incomingPoints.length === 0) {
-    return res.json({ ok: true, received: 0, new: 0, duplicates: 0 });
+    incomingPoints.push({
+      timestamp: beat.timestamp,
+      rr_interval: beat.rrInterval,
+      heart_rate: beat.heartRate ?? null,
+      source,
+      path: 'batch',
+      batch_type: batchType,
+      upload_id: uploadId,
+      session_id: beat.sessionId ?? null,
+      beat_seq: beat.beatSeq ?? null,
+      recording_id: beat.recordingId ?? null,
+      recording_seq: beat.recordingSeq ?? null
+    });
   }
 
   incomingPoints.sort((a, b) => a.timestamp - b.timestamp);
+  let newPoints = [];
+  let duplicateCount = 0;
 
-  const firstTs = incomingPoints[0].timestamp;
-  const lastTs = incomingPoints[incomingPoints.length - 1].timestamp;
+  if (batchType === 'buffered_realtime') {
+    const bySession = new Map();
+    for (const p of incomingPoints) {
+      if (!bySession.has(p.session_id)) bySession.set(p.session_id, []);
+      bySession.get(p.session_id).push(p);
+    }
 
-  // Query existing points for gap-based dedup (2s padding covers any RR at boundaries)
-  let existing = [];
-  try {
-    existing = await writers.queryRawBeats(device, firstTs - 2000, lastTs + 2000);
-  } catch (err) {
-    log(`Dedup query failed, writing all: ${err.message}`);
-  }
+    const existingBySession = new Map();
+    for (const [sessionId, points] of bySession.entries()) {
+      const seqs = points.map(p => p.beat_seq);
+      const minSeq = Math.min(...seqs);
+      const maxSeq = Math.max(...seqs);
+      const existingSeqs = await writers.queryExistingBeatSeqs(device, sessionId, minSeq, maxSeq);
+      existingBySession.set(sessionId, existingSeqs);
+    }
 
-  // Gap-based dedup: find gaps in existing data, only insert batch beats into gaps
-  let newPoints;
+    const seen = new Set();
+    for (const p of incomingPoints) {
+      const key = `${p.session_id}:${p.beat_seq}`;
+      if (seen.has(key)) {
+        duplicateCount++;
+        continue;
+      }
+      seen.add(key);
 
-  if (existing.length === 0) {
-    newPoints = incomingPoints;
+      const existingSeqs = existingBySession.get(p.session_id) || new Set();
+      if (existingSeqs.has(p.beat_seq)) {
+        duplicateCount++;
+      } else {
+        newPoints.push(p);
+      }
+    }
   } else {
-    const gaps = [];
-    for (let i = 0; i < existing.length - 1; i++) {
-      const expectedNext = existing[i].time + (existing[i].rr_interval || 0);
-      const actualNext = existing[i + 1].time;
-      if (actualNext - expectedNext > GAP_THRESHOLD_MS) {
-        gaps.push({ start: expectedNext, end: actualNext });
+    const byRecording = new Map();
+    for (const p of incomingPoints) {
+      if (!byRecording.has(p.recording_id)) byRecording.set(p.recording_id, []);
+      byRecording.get(p.recording_id).push(p);
+    }
+
+    const existingByRecording = new Map();
+    for (const [recordingId, points] of byRecording.entries()) {
+      const seqs = points.map(p => p.recording_seq);
+      const minSeq = Math.min(...seqs);
+      const maxSeq = Math.max(...seqs);
+      const existingSeqs = await writers.queryExistingRecordingSeqs(device, recordingId, minSeq, maxSeq);
+      existingByRecording.set(recordingId, existingSeqs);
+    }
+
+    const seenRecording = new Set();
+    const candidates = [];
+    for (const p of incomingPoints) {
+      const recKey = `${p.recording_id}:${p.recording_seq}`;
+      if (seenRecording.has(recKey)) {
+        duplicateCount++;
+        continue;
+      }
+      seenRecording.add(recKey);
+
+      const existingSeqs = existingByRecording.get(p.recording_id) || new Set();
+      if (existingSeqs.has(p.recording_seq)) {
+        duplicateCount++;
+      } else {
+        candidates.push(p);
       }
     }
 
-    // Leading edge
-    if (firstTs < existing[0].time - GAP_THRESHOLD_MS) {
-      gaps.unshift({ start: firstTs, end: existing[0].time });
-    }
+    if (candidates.length > 0) {
+      const firstTs = candidates[0].timestamp;
+      const lastTs = candidates[candidates.length - 1].timestamp;
 
-    // Trailing edge
-    const lastEx = existing[existing.length - 1];
-    const trailingStart = lastEx.time + (lastEx.rr_interval || 0);
-    if (lastTs > trailingStart + GAP_THRESHOLD_MS) {
-      gaps.push({ start: trailingStart, end: lastTs + 2000 });
-    }
+      let existing = [];
+      try {
+        existing = await writers.queryRawBeats(device, firstTs - 2000, lastTs + 2000);
+      } catch (err) {
+        log(`Recording dedup query failed, writing all candidates: ${err.message}`);
+      }
 
-    newPoints = incomingPoints.filter(p =>
-      gaps.some(g => p.timestamp >= g.start - GAP_THRESHOLD_MS
-                  && p.timestamp <= g.end + GAP_THRESHOLD_MS));
+      if (existing.length === 0) {
+        newPoints = candidates;
+      } else {
+        // First pass: drop candidates that already have a nearby existing beat
+        // (prevents recording path from reinserting surrounding beats near a real gap).
+        const dedupCandidates = [];
+        let exIdx = 0;
+        for (const p of candidates) {
+          while (exIdx < existing.length - 1
+              && existing[exIdx + 1].time < p.timestamp - RECORDING_DUPLICATE_PROXIMITY_MS) {
+            exIdx++;
+          }
+
+          let hasNearbyExisting = false;
+          let i = Math.max(0, exIdx - 1);
+          while (i < existing.length && existing[i].time <= p.timestamp + RECORDING_DUPLICATE_PROXIMITY_MS) {
+            if (Math.abs(existing[i].time - p.timestamp) <= RECORDING_DUPLICATE_PROXIMITY_MS) {
+              hasNearbyExisting = true;
+              break;
+            }
+            i++;
+          }
+
+          if (hasNearbyExisting) {
+            duplicateCount++;
+          } else {
+            dedupCandidates.push(p);
+          }
+        }
+
+        const gaps = [];
+        for (let i = 0; i < existing.length - 1; i++) {
+          const expectedNext = existing[i].time + (existing[i].rr_interval || 0);
+          const actualNext = existing[i + 1].time;
+          if (actualNext - expectedNext > GAP_THRESHOLD_MS) {
+            gaps.push({ start: expectedNext, end: actualNext });
+          }
+        }
+
+        if (firstTs < existing[0].time - GAP_THRESHOLD_MS) {
+          gaps.unshift({ start: firstTs, end: existing[0].time });
+        }
+
+        const lastEx = existing[existing.length - 1];
+        const trailingStart = lastEx.time + (lastEx.rr_interval || 0);
+        if (lastTs > trailingStart + GAP_THRESHOLD_MS) {
+          gaps.push({ start: trailingStart, end: lastTs + 2000 });
+        }
+
+        newPoints = dedupCandidates.filter(p =>
+          gaps.some(g => p.timestamp >= g.start - RECORDING_GAP_EDGE_TOLERANCE_MS
+                      && p.timestamp <= g.end + RECORDING_GAP_EDGE_TOLERANCE_MS));
+        duplicateCount += dedupCandidates.length - newPoints.length;
+      }
+    }
   }
 
-  const duplicateCount = incomingPoints.length - newPoints.length;
-
-  // Write new points to polar_raw
   if (newPoints.length > 0) {
     try {
       await writers.writeRawBatch(device, newPoints);
-    } catch (err) {
+    } catch {
       return res.status(500).json({ ok: false, error: 'InfluxDB write failed' });
     }
-
-    // Trigger post-processor to reprocess from the batch start
-    postProcessor.triggerReprocess(device, firstTs);
+    const firstNewTs = newPoints[0].timestamp;
+    const reprocessFrom = Math.max(0, firstNewTs - REPROCESS_REWIND_MS);
+    const streamHints = batchType === 'buffered_realtime'
+      ? [...new Set(newPoints.map(p => p.session_id).filter(Boolean))].map(id => ({ type: 'session', id }))
+      : [...new Set(newPoints.map(p => p.recording_id).filter(Boolean))].map(id => ({ type: 'recording', id }));
+    await postProcessor.triggerReprocess(device, reprocessFrom, streamHints);
   }
 
-  // Log
+  try {
+    await writers.writeUploadReceipt(device, batchType, uploadId, {
+      received: incomingPoints.length,
+      new: newPoints.length,
+      duplicates: duplicateCount
+    });
+  } catch (err) {
+    log(`Upload receipt write failed: ${err.message}`);
+  }
+
+  const firstTs = incomingPoints[0].timestamp;
+  const lastTs = incomingPoints[incomingPoints.length - 1].timestamp;
   const durationMin = ((lastTs - firstTs) / 60000).toFixed(1);
   const deviceShort = device.length > 11 ? device.slice(0, 11) + '...' : device;
   const fmt = ts => localTimestamp(new Date(ts)).slice(11, 19);
-  log(`Batch: ${incomingPoints.length} beats, ${newPoints.length} new, ${duplicateCount} dupes from ${source || 'unknown'} for ${deviceShort} | ${fmt(firstTs)} → ${fmt(lastTs)} (${durationMin}min)`);
-  if (incomingPoints.length <= 10) {
-    const now = Date.now();
-    for (const p of incomingPoints) {
-      const age = ((now - p.timestamp) / 1000).toFixed(1);
-      const origin = p.heart_rate ? 'buf' : 'rec';
-      log(`  ts=${p.timestamp} RR=${p.rr_interval}ms (${age}s ago) [${origin}]`);
-    }
-  }
+  log(`Batch[${batchType}] uploadId=${uploadId}: ${incomingPoints.length} beats, ${newPoints.length} new, ${duplicateCount} dupes from ${source || 'unknown'} for ${deviceShort} | ${fmt(firstTs)} → ${fmt(lastTs)} (${durationMin}min)`);
 
-  res.json({ ok: true, received: incomingPoints.length, new: newPoints.length, duplicates: duplicateCount });
+  res.json({
+    ok: true,
+    replay: false,
+    received: incomingPoints.length,
+    new: newPoints.length,
+    duplicates: duplicateCount
+  });
 });
 
 /**
@@ -524,7 +697,7 @@ app.get('/health', (req, res) => {
 server.listen(PORT, () => {
   log(`Polar Hub listening on port ${PORT}`);
   log(`Status page available at http://localhost:${PORT}/`);
-  log(`Gap-based batch dedup threshold: ${GAP_THRESHOLD_MS}ms`);
+  log(`Recording gap-dedup threshold: ${GAP_THRESHOLD_MS}ms (dup proximity=${RECORDING_DUPLICATE_PROXIMITY_MS}ms, edge tolerance=${RECORDING_GAP_EDGE_TOLERANCE_MS}ms)`);
   if (LOG_REQUESTS) log(`Request logging enabled`);
   if (TEST_MODE) log(`TEST MODE: database=${config.influxDatabase}_test, port=${PORT}`);
   postProcessor.start();
