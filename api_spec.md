@@ -115,14 +115,104 @@ Define a deterministic beat identity and remove array ambiguity by making one be
 }
 ```
 
-## 5. Dedup/Reconciliation Contract
+## 5. Endpoint: `POST /posture`
+
+Used for explicit posture transition events.
+
+### Required fields
+
+- `fromPosture` (string)
+- `toPosture` (string)
+
+### Optional fields
+
+- `source` (string)
+- `device` (string)
+- `fromDurationSeconds` (number, seconds)
+- `confidence` (number)
+
+### Example
+
+```json
+{
+  "source": "iphone",
+  "device": "1A2B3C4D",
+  "fromPosture": "lying_back",
+  "toPosture": "upright",
+  "fromDurationSeconds": 123,
+  "confidence": 0.91
+}
+```
+
+### Response
+
+```json
+{ "ok": true }
+```
+
+Notes:
+- The current server only validates `fromPosture` and `toPosture`.
+- The current implementation writes the posture transition to `polar_posture`.
+
+## 6. Endpoint: `POST /status`
+
+Used for relay/app status events.
+
+### Required fields
+
+- `category` (string)
+- `event` (string)
+
+### Optional fields
+
+- `source` (string)
+- `device` (string)
+- `description` (string)
+- `fields` (object)
+
+### Example
+
+```json
+{
+  "source": "iphone",
+  "device": "1A2B3C4D",
+  "category": "ble",
+  "event": "connected",
+  "description": "Connected to Polar H10",
+  "fields": { "rssi": -55 }
+}
+```
+
+### Response
+
+```json
+{ "ok": true }
+```
+
+Notes:
+- The current server only validates `category` and `event`.
+- All status events are logged.
+- Only this allow-list is persisted to `polar_relay_status`:
+  - `ble.connected`
+  - `ble.disconnected`
+  - `ble.pmd_locked`
+  - `session.recording`
+  - `session.download_complete`
+  - `session.error`
+  - `stream.hr_interrupted`
+  - `stream.hr_recovered`
+  - `upload.server_online`
+  - `upload.server_offline`
+- On `ble.disconnected`, the current server resets in-memory device state.
+
+## 7. Dedup/Reconciliation Contract
 
 1. Live vs buffered realtime: exact match on `(sessionId, beatSeq)`; retries are idempotent.
 2. Recording vs anything else: do not exact-match with `beatSeq`; use server heuristic reconciliation.
 3. Recording identity is `(recordingId, recordingSeq)` for recording-only idempotency and replay handling.
 4. Batch replay protection: dedupe by `uploadId` at chunk level.
 
-## 6. Sequence Requirements
+## 8. Sequence Requirements
 
 1. `beatSeq` must never be reused within a `sessionId`.
 2. If `/beats` fails and later goes via buffered batch, keep the same `sessionId + beatSeq`.
